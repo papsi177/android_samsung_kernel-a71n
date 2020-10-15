@@ -38,6 +38,9 @@ enum {
 	WCD_BOLERO_EVT_RX_MUTE = 1, /* for RX mute/unmute */
 	WCD_BOLERO_EVT_IMPED_TRUE,   /* for imped true */
 	WCD_BOLERO_EVT_IMPED_FALSE,  /* for imped false */
+#ifdef CONFIG_SND_SOC_IMPED_SENSING
+	SEC_WCD_BOLERO_EVT_IMPED_TRUE,	/* for SEC imped true */
+#endif
 };
 
 struct wcd_ctrl_platform_data {

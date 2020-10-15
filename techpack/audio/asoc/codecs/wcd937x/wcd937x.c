@@ -1392,6 +1392,21 @@ int wcd937x_micbias_control(struct snd_soc_codec *codec,
 }
 EXPORT_SYMBOL(wcd937x_micbias_control);
 
+void wcd937x_disable_bcs_before_slow_insert(struct snd_soc_codec *codec,
+					    bool bcs_disable)
+{
+	struct wcd937x_priv *wcd937x = snd_soc_codec_get_drvdata(codec);
+
+	if (wcd937x->update_wcd_event) {
+		if (bcs_disable)
+			wcd937x->update_wcd_event(wcd937x->handle,
+						WCD_BOLERO_EVT_BCS_CLK_OFF, 0);
+		else
+			wcd937x->update_wcd_event(wcd937x->handle,
+						WCD_BOLERO_EVT_BCS_CLK_OFF, 1);
+	}
+}
+
 static int wcd937x_get_logical_addr(struct swr_device *swr_dev)
 {
 	int ret = 0;
@@ -2025,6 +2040,11 @@ static const struct snd_soc_dapm_route wcd937x_audio_map[] = {
 	{"EAR_RDAC", "Switch", "RDAC3"},
 	{"EAR PGA", NULL, "EAR_RDAC"},
 	{"EAR", NULL, "EAR PGA"},
+
+	{"EAR", NULL, "CLS_H_PORT"},
+	{"HPHR", NULL, "CLS_H_PORT"},
+	{"HPHL", NULL, "CLS_H_PORT"},
+	{"AUX", NULL, "CLS_H_PORT"},
 };
 
 static const struct snd_soc_dapm_route wcd9375_audio_map[] = {
@@ -2492,6 +2512,21 @@ static int wcd937x_reset_low(struct device *dev)
 struct wcd937x_pdata *wcd937x_populate_dt_data(struct device *dev)
 {
 	struct wcd937x_pdata *pdata = NULL;
+#ifdef CONFIG_SND_SOC_IMPED_SENSING
+	int rc = 0;
+	int i;
+	struct of_phandle_args imp_list;
+	struct wcd937x_gain_table default_table[MAX_IMPEDANCE_TABLE] = {
+		{    0,       0, 6},
+		{    1,      13, 0},
+		{   14,      25, 3},
+		{   26,      42, 4},
+		{   43,     100, 5},
+		{  101,     200, 7},
+		{  201,    1000, 8},
+		{ 1001, INT_MAX, 6},
+	};
+#endif
 
 	pdata = kzalloc(sizeof(struct wcd937x_pdata),
 				GFP_KERNEL);
@@ -2520,6 +2555,26 @@ struct wcd937x_pdata *wcd937x_populate_dt_data(struct device *dev)
 	pdata->rx_slave = of_parse_phandle(dev->of_node, "qcom,rx-slave", 0);
 	pdata->tx_slave = of_parse_phandle(dev->of_node, "qcom,tx-slave", 0);
 	wcd937x_dt_parse_micbias_info(dev, &pdata->micbias);
+
+#ifdef CONFIG_SND_SOC_IMPED_SENSING
+	for (i = 0; i < ARRAY_SIZE(pdata->imp_table); i++) {
+		rc = of_parse_phandle_with_args(dev->of_node,
+			"imp-table", "#list-imp-cells", i, &imp_list);
+		if (rc < 0) {
+			pdata->imp_table[i].min = default_table[i].min;
+			pdata->imp_table[i].max = default_table[i].max;
+			pdata->imp_table[i].gain = default_table[i].gain;
+		} else {
+			pdata->imp_table[i].min = imp_list.args[0];
+			pdata->imp_table[i].max = imp_list.args[1];
+			pdata->imp_table[i].gain = imp_list.args[2];
+		}
+		dev_info(dev, "impedance gain table %d, %d, %d\n",
+			pdata->imp_table[i].min,
+			pdata->imp_table[i].max,
+			pdata->imp_table[i].gain);
+	}
+#endif
 
 	return pdata;
 }

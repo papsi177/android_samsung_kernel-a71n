@@ -28,13 +28,16 @@
 #define Q13 (1<<13)
 #define Q7 (1<<7)
 
-struct afe_spk_ctl {
-	struct class *p_class;
-	struct device *p_dev;
-	struct afe_sp_rx_tmax_xmax_logging_param xt_logging;
-	int32_t max_temperature_rd[SP_V2_NUM_MAX_SPKR];
-};
+
 struct afe_spk_ctl this_afe_spk;
+
+#ifdef CONFIG_SND_SOC_SAMSUNG_AUDIO
+struct afe_spk_ctl *get_wsa_sysfs_ptr(void)
+{
+	return &this_afe_spk;
+}
+EXPORT_SYMBOL(get_wsa_sysfs_ptr);
+#endif
 
 static ssize_t sp_count_exceeded_temperature_l_show(struct device *dev,
 		struct device_attribute *attr,
@@ -176,10 +179,11 @@ static ssize_t q6afe_initial_cal_show(struct device *dev,
 				      struct device_attribute *attr,
 				      char *buf)
 {
-	//return snprintf(buf, BUF_SZ, "%d\n", afe_get_spk_initial_cal());
-
-	/* customizing code to support samsung amp calibration routine */
+#ifdef CONFIG_SND_SOC_SAMSUNG_AUDIO
 	return snprintf(buf, BUF_SZ, "%s\n", afe_get_spk_initial_cal() ? "Enabled" : "Disabled");
+#else
+	return snprintf(buf, BUF_SZ, "%d\n", afe_get_spk_initial_cal());
+#endif
 }
 
 static ssize_t q6afe_initial_cal_store(struct device *dev,
@@ -206,9 +210,11 @@ static ssize_t q6afe_v_vali_flag_show(struct device *dev,
 				      struct device_attribute *attr,
 				      char *buf)
 {
-	//return snprintf(buf, BUF_SZ, "%d\n", afe_get_spk_v_vali_flag());
-	/* customizing code to support samsung amp validation routine */
+#ifdef CONFIG_SND_SOC_SAMSUNG_AUDIO
 	return snprintf(buf, BUF_SZ, "%s\n", afe_get_spk_v_vali_flag() ? "Enabled" : "Disabled");
+#else
+	return snprintf(buf, BUF_SZ, "%d\n", afe_get_spk_v_vali_flag());
+#endif
 }
 
 static ssize_t q6afe_v_vali_flag_store(struct device *dev,

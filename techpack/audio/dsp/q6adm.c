@@ -2857,9 +2857,9 @@ int adm_open(int port_id, int path, int rate, int channel_mode, int topology,
 	void *adm_params = NULL;
 	int param_size;
 
-	pr_info("%s:port %#x path:%d rate:%d mode:%d perf_mode:%d,topo_id %#x\n",
-		__func__, port_id, path, rate, channel_mode, perf_mode,
-		topology);
+	pr_info("%s:port %#x path:%d rate:%d mode:%d perf_mode:%d,topo_id %d\n",
+		 __func__, port_id, path, rate, channel_mode, perf_mode,
+		 topology);
 	pr_info("%s:bit_width:%d app_type:%#x acdb_id:%d\n",
 		__func__, bit_width, app_type, acdb_id);
 
@@ -2911,14 +2911,19 @@ int adm_open(int port_id, int path, int rate, int channel_mode, int topology,
 	}
 
 	if ((topology == VPM_TX_SM_ECNS_V2_COPP_TOPOLOGY) ||
-	    (topology == VPM_TX_DM_FLUENCE_COPP_TOPOLOGY) ||
-	    (topology == VPM_TX_DM_RFECNS_COPP_TOPOLOGY)||
 	    (topology == VPM_TX_DM_FLUENCE_EF_COPP_TOPOLOGY)) {
 		if ((rate != ADM_CMD_COPP_OPEN_SAMPLE_RATE_8K) &&
 		    (rate != ADM_CMD_COPP_OPEN_SAMPLE_RATE_16K) &&
 		    (rate != ADM_CMD_COPP_OPEN_SAMPLE_RATE_32K) &&
 		    (rate != ADM_CMD_COPP_OPEN_SAMPLE_RATE_48K))
-		rate = 16000;
+			rate = 16000;
+	}
+	if ((topology == VPM_TX_DM_FLUENCE_COPP_TOPOLOGY) ||
+	    (topology == VPM_TX_DM_RFECNS_COPP_TOPOLOGY)) {
+		if ((rate != ADM_CMD_COPP_OPEN_SAMPLE_RATE_8K) &&
+		    (rate != ADM_CMD_COPP_OPEN_SAMPLE_RATE_16K) &&
+		    (rate != ADM_CMD_COPP_OPEN_SAMPLE_RATE_32K))
+			rate = 16000;
 	}
 
 	if (topology == FFECNS_TOPOLOGY) {
@@ -2932,9 +2937,9 @@ int adm_open(int port_id, int path, int rate, int channel_mode, int topology,
 	    (topology == VPM_TX_SM_LVSAFQ_COPP_TOPOLOGY) ||
 	    (topology == VPM_TX_DM_LVSAFQ_COPP_TOPOLOGY) ||
 	    (topology == VOICE_TX_DIAMONDVOICE_FVSAM_SM) ||
+	    (topology == VOICE_TX_DIAMONDVOICE_FRSAM_DM) ||
 	    (topology == VOICE_TX_DIAMONDVOICE_FVSAM_DM) ||
-	    (topology == VOICE_TX_DIAMONDVOICE_FVSAM_QM) ||
-	    (topology == VOICE_TX_DIAMONDVOICE_FRSAM_DM))
+	    (topology == VOICE_TX_DIAMONDVOICE_FVSAM_QM))
 		rate = 16000;
 
 	if (topology == VPM_TX_VOICE_SMECNS_V2_COPP_TOPOLOGY)
