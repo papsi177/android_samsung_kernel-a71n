@@ -161,6 +161,8 @@ struct tx_macro_priv {
 			[TX_MACRO_CHILD_DEVICES_MAX];
 	int child_count;
 	bool bcs_enable;
+	bool bcs_clk_en;
+	bool hs_slow_insert_complete;
 };
 
 static bool tx_macro_get_data(struct snd_soc_codec *codec,
@@ -347,6 +349,9 @@ static int tx_macro_event_handler(struct snd_soc_codec *codec, u16 event,
 	if (!tx_macro_get_data(codec, &tx_dev, &tx_priv, __func__))
 		return -EINVAL;
 
+	if(!tx_priv->swr_ctrl_data)
+	return -EINVAL;
+
 	switch (event) {
 	case BOLERO_MACRO_EVT_SSR_DOWN:
 		swrm_wcd_notify(
@@ -366,6 +371,15 @@ static int tx_macro_event_handler(struct snd_soc_codec *codec, u16 event,
 	case BOLERO_MACRO_EVT_CLK_RESET:
 		tx_macro_mclk_reset(tx_dev);
 		break;
+	case BOLERO_MACRO_EVT_BCS_CLK_OFF:
+		if (tx_priv->bcs_clk_en)
+			snd_soc_update_bits(codec,
+				BOLERO_CDC_TX0_TX_PATH_SEC7, 0x40, data << 6);
+		if (data)
+			tx_priv->hs_slow_insert_complete = true;
+		else
+			tx_priv->hs_slow_insert_complete = false;
+		break;
 	}
 	return 0;
 }
@@ -380,6 +394,9 @@ static int tx_macro_reg_wake_irq(struct snd_soc_codec *codec,
 
 	if (!tx_macro_get_data(codec, &tx_dev, &tx_priv, __func__))
 		return -EINVAL;
+
+	 if(!tx_priv->swr_ctrl_data)
+	 return -EINVAL;
 
 	ret = swrm_wcd_notify(
 		tx_priv->swr_ctrl_data[0].tx_swr_pdev,
@@ -755,8 +772,11 @@ static int tx_macro_enable_dec(struct snd_soc_dapm_widget *w,
 		if (tx_priv->bcs_enable) {
 			snd_soc_update_bits(codec, dec_cfg_reg,
 					0x01, 0x01);
-			snd_soc_update_bits(codec, BOLERO_CDC_TX0_TX_PATH_SEC7,
-					    0x40, 0x40);
+			tx_priv->bcs_clk_en = true;
+			if (tx_priv->hs_slow_insert_complete)
+				snd_soc_update_bits(codec,
+					BOLERO_CDC_TX0_TX_PATH_SEC7, 0x40,
+					0x40);
 		}
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
@@ -791,6 +811,7 @@ static int tx_macro_enable_dec(struct snd_soc_dapm_widget *w,
 					0x01, 0x00);
 			snd_soc_update_bits(codec, BOLERO_CDC_TX0_TX_PATH_SEC7,
 					    0x40, 0x00);
+			tx_priv->bcs_clk_en = false;
 		}
 		break;
 	}

@@ -222,7 +222,8 @@ enum wcd_mbhc_register_function {
 	WCD_MBHC_ADC_MODE,
 	WCD_MBHC_DETECTION_DONE,
 	WCD_MBHC_ELECT_ISRC_EN,
-	WCD_MBHC_NOISE_FILT_CTRL,
+	WCD_MBHC_EN_SURGE_PROTECTION_HPHL,
+	WCD_MBHC_EN_SURGE_PROTECTION_HPHR,
 	WCD_MBHC_REG_FUNC_MAX,
 };
 
@@ -462,6 +463,8 @@ struct wcd_mbhc_register {
 };
 
 struct wcd_mbhc_cb {
+	void (*bcs_enable)
+	(struct wcd_mbhc *mbhc, bool bcs_enable);
 	int (*enable_mb_source)(struct wcd_mbhc *, bool);
 	void (*trim_btn_reg)(struct snd_soc_codec *);
 	void (*compute_impedance)(struct wcd_mbhc *, uint32_t *, uint32_t *);
@@ -597,17 +600,18 @@ struct wcd_mbhc {
 
 	unsigned long intr_status;
 	bool is_hph_ocp_pending;
-
+#if defined(CONFIG_SND_SOC_WCD_MBHC_SLOW_DET)
+	bool slow_insertion;
+#endif
 	struct wcd_mbhc_fn *mbhc_fn;
 	bool force_linein;
 	struct device_node *fsa_np;
 	struct notifier_block fsa_nb;
 
 	bool pullup_enable;
-	int impedance_offset;
-#if defined(CONFIG_SND_SOC_WCD_MBHC_SLOW_DET)
+#ifdef CONFIG_SND_SOC_IMPED_SENSING
 	int default_impedance_offset;
-	bool slow_insertion;
+	int impedance_offset;
 #endif
 };
 
