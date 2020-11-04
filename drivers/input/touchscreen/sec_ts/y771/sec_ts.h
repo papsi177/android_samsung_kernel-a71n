@@ -102,10 +102,10 @@
 
 #define SEC_TS_EVENTID_HOVER		10
 
-#define SEC_TS_DEFAULT_FW_NAME		"tsp_sec/y771_beyond2.bin"
-#define SEC_TS_DEFAULT_UMS_FW		"/sdcard/Firmware/TSP/lsi.bin"
-#define SEC_TS_DEFAULT_SPU_FW		"/spu/TSP/ffu_tsp.bin"
-#define SEC_TS_DEFAULT_FFU_FW		"ffu_tsp.bin"
+#define TSP_PATH_EXTERNAL_FW		"/sdcard/Firmware/TSP/tsp.bin"
+#define TSP_PATH_EXTERNAL_FW_SIGNED	"/sdcard/Firmware/TSP/tsp_signed.bin"
+#define TSP_PATH_SPU_FW_SIGNED		"/spu/TSP/ffu_tsp.bin"
+
 #define SEC_TS_MAX_FW_PATH		64
 #define SEC_TS_FW_BLK_SIZE_MAX		(512)
 #define SEC_TS_FW_BLK_SIZE_DEFAULT	(512)	// y761 & y771 ~
@@ -199,7 +199,8 @@
 #define SEC_TS_CMD_LPM_AOD_OFF_ON		0x9B
 #define SEC_TS_CMD_SIP_MODE			0xB5
 #define SET_TS_CMD_SET_LOWTEMPERATURE_MODE	0xBE
-#define SET_TS_CMD_ELVSS_TEST	0xD7
+#define SET_TS_CMD_ELVSS_TEST			0xD7
+#define SET_TS_CMD_SRAM_TEST			0x9D
 
 #define SEC_TS_CMD_LPM_AOD_OFF	0x01
 #define SEC_TS_CMD_LPM_AOD_ON	0x02
@@ -734,7 +735,7 @@ struct sec_ts_data {
 	struct sec_ts_plat_data *plat_data;
 	struct sec_ts_coordinate coord[MAX_SUPPORT_TOUCH_COUNT + MAX_SUPPORT_HOVER_COUNT];
 
-
+	u8 fod_lp_mode;
 	u8 lowpower_mode;
 	u8 brush_mode;
 	u8 touchable_area;
