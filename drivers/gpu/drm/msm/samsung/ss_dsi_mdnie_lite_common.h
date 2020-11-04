@@ -39,6 +39,14 @@ Copyright (C) 2012, Samsung Electronics. All rights reserved.
 #define MDNIE_SCR_CMD_SIZE 24
 #define AFC_ROI_CMD_SIZE 12
 
+/*this is special case for SiliconWorks DDI SW83106*/
+#define MDNIE_SCR_CMD_SIZE_EXTRA_1 27
+#define MDNIE_SCR_CMD_SIZE_EXTRA_2 9
+
+#define WHITE_TEMPERATURE_STEP		8
+#define	WHITE_TEMPERATURE_NUM		9
+#define	WHITE_TEMPERATURE_RGB_NUM	27
+
 extern char mdnie_app_name[][NAME_STRING_MAX];
 extern char mdnie_mode_name[][NAME_STRING_MAX];
 extern char outdoor_name[][NAME_STRING_MAX];
@@ -210,7 +218,19 @@ enum {
 	MDNIE_STEP1 = 0,
 	MDNIE_STEP2,
 	MDNIE_STEP3,
-	MDNIE_STEP_MAX,
+	MDNIE_STEP4,
+	MDNIE_STEP5,
+	MDNIE_STEP6,
+	MDNIE_STEP7,
+	MDNIE_STEP8,
+	MDNIE_STEP9,
+	MDNIE_STEP10,
+	MDNIE_STEP11,
+	MDNIE_STEP12,
+	MDNIE_STEP13,
+	MDNIE_STEP14,
+	MDNIE_STEP15,
+	MDNIE_STEP_MAX
 };
 
 enum {
@@ -256,6 +276,7 @@ struct mdnie_lite_tune_data {
 	char *DSI_NIGHT_MODE_MDNIE_1;
 	char *DSI_NIGHT_MODE_MDNIE_2;
 	char *DSI_NIGHT_MODE_MDNIE_SCR;
+	char *DSI_NIGHT_MODE_MDNIE_SCR_EXTRA;/*this is special case for SiliconWorks DDI SW83106*/
 	char *DSI_COLOR_LENS_MDNIE_1;
 	char *DSI_COLOR_LENS_MDNIE_2;
 	char *DSI_COLOR_LENS_MDNIE_SCR;
@@ -330,6 +351,7 @@ struct mdnie_lite_tune_data {
 
 	int dsi_bypass_mdnie_size;
 	int mdnie_color_blinde_cmd_offset;
+	int mdnie_color_blinde_cmd_offset_extra;/*this is special case for SiliconWorks DDI SW83106*/
 	int mdnie_step_index[MDNIE_STEP_MAX];
 	int address_scr_white[ADDRESS_SCR_WHITE_MAX];
 	int dsi_rgb_sensor_mdnie_1_size;
@@ -339,7 +361,9 @@ struct mdnie_lite_tune_data {
 	char **dsi_adjust_ldu_table;
 	int dsi_max_adjust_ldu;
 	char *dsi_night_mode_table;
+	char *dsi_night_mode_table_extra; /*this is special case for SiliconWorks DDI SW83106*/
 	int dsi_max_night_mode_index;
+	int dsi_max_night_mode_index_extra; /*this is special case for SiliconWorks DDI SW83106*/
 	char *dsi_color_lens_table;
 	int dsi_scr_step_index;
 	char dsi_white_default_r;
@@ -353,6 +377,22 @@ struct mdnie_lite_tune_data {
 	int dsi_white_balanced_b;
 	int dsi_afc_size;
 	int dsi_afc_index;
+	int support_mode;
+	int support_scenario;
+	int support_outdoor;
+	int support_bypass;
+	int support_accessibility;
+	int support_sensorRGB;
+	int support_whiteRGB;
+	int support_mdnie_ldu;
+	int support_night_mode;
+	int support_color_lens;
+	int support_hdr;
+	int support_light_notification;
+	int support_afc;
+	int support_cabc;
+	int support_hmt_color_temperature;
+	int support_siliconworks;
 };
 
 /* COMMON FUNCTION*/
@@ -368,7 +408,7 @@ void coordinate_tunning_calculate(struct samsung_display_driver_data *vdd,
 
 void coordinate_tunning_multi(struct samsung_display_driver_data *vdd,
     char (*coordinate_data_multi[MAX_MODE])[COORDINATE_DATA_SIZE], int mdnie_tune_index, int scr_wr_addr, int data_size);
-    
+
 /* COMMON FUNCTION END*/
 
 #endif /*_DSI_TCON_MDNIE_H_*/

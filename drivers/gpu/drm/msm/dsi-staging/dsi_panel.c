@@ -356,65 +356,105 @@ int dsi_panel_trigger_esd_attack(struct dsi_panel *panel)
 	return -EINVAL;
 }
 
-static int dsi_panel_reset(struct dsi_panel *panel)
-{
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+int dsi_panel_reset_prepare(struct dsi_panel *panel){
 	int rc = 0;
 	struct dsi_panel_reset_config *r_config = &panel->reset_config;
 	int i;
-
-	if (gpio_is_valid(panel->reset_config.disp_en_gpio)) {
-		rc = gpio_direction_output(panel->reset_config.disp_en_gpio, 1);
-		if (rc) {
-			pr_err("unable to set dir for disp gpio rc=%d\n", rc);
-			goto exit;
-		}
-	}
 
 	if (r_config->count) {
 		rc = gpio_direction_output(r_config->reset_gpio,
 			r_config->sequence[0].level);
 		if (rc) {
 			pr_err("unable to set dir for rst gpio rc=%d\n", rc);
-			goto exit;
+			return rc;
 		}
 	}
-
 	for (i = 0; i < r_config->count; i++) {
-		gpio_set_value(r_config->reset_gpio,
-			       r_config->sequence[i].level);
-
+		gpio_set_value(r_config->reset_gpio,  r_config->sequence[i].level);
 
 		if (r_config->sequence[i].sleep_ms)
 			usleep_range(r_config->sequence[i].sleep_ms * 1000,
 				(r_config->sequence[i].sleep_ms * 1000) + 100);
 	}
-
-	if (gpio_is_valid(panel->bl_config.en_gpio)) {
-		rc = gpio_direction_output(panel->bl_config.en_gpio, 1);
-		if (rc)
-			pr_err("unable to set dir for bklt gpio rc=%d\n", rc);
-	}
-
-	if (gpio_is_valid(panel->reset_config.lcd_mode_sel_gpio)) {
-		bool out = true;
-
-		if ((panel->reset_config.mode_sel_state == MODE_SEL_DUAL_PORT)
-				|| (panel->reset_config.mode_sel_state
-					== MODE_GPIO_LOW))
-			out = false;
-		else if ((panel->reset_config.mode_sel_state
-				== MODE_SEL_SINGLE_PORT) ||
-				(panel->reset_config.mode_sel_state
-				 == MODE_GPIO_HIGH))
-			out = true;
-
-		rc = gpio_direction_output(
-			panel->reset_config.lcd_mode_sel_gpio, out);
-		if (rc)
-			pr_err("unable to set dir for mode gpio rc=%d\n", rc);
-	}
-exit:
 	return rc;
+}
+#endif
+
+static int dsi_panel_reset(struct dsi_panel *panel)
+{
+    int rc = 0;
+#if !defined(CONFIG_DISPLAY_SAMSUNG)
+    struct dsi_panel_reset_config *r_config = &panel->reset_config;
+    int i;
+#endif
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+    struct samsung_display_driver_data *vdd = panel->panel_private;
+#endif
+
+    if (gpio_is_valid(panel->reset_config.disp_en_gpio)) {
+        rc = gpio_direction_output(panel->reset_config.disp_en_gpio, 1);
+        if (rc) {
+            pr_err("unable to set dir for disp gpio rc=%d\n", rc);
+            goto exit;
+        }
+    }
+#if !defined(CONFIG_DISPLAY_SAMSUNG)
+    if (r_config->count) {
+        rc = gpio_direction_output(r_config->reset_gpio,
+            r_config->sequence[0].level);
+        if (rc) {
+            pr_err("unable to set dir for rst gpio rc=%d\n", rc);
+            goto exit;
+        }
+    }
+
+    for (i = 0; i < r_config->count; i++) {
+        gpio_set_value(r_config->reset_gpio,
+                   r_config->sequence[i].level);
+
+
+        if (r_config->sequence[i].sleep_ms)
+            usleep_range(r_config->sequence[i].sleep_ms * 1000,
+                (r_config->sequence[i].sleep_ms * 1000) + 100);
+    }
+#endif
+
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+    if (!vdd->dtsi_data.samsung_reset_after_dsi_on){
+        rc = dsi_panel_reset_prepare(panel);
+        if (rc) {
+            pr_err("panel reset failed, rc=%d\n", rc);
+        }
+    }
+#endif
+
+    if (gpio_is_valid(panel->bl_config.en_gpio)) {
+        rc = gpio_direction_output(panel->bl_config.en_gpio, 1);
+        if (rc)
+            pr_err("unable to set dir for bklt gpio rc=%d\n", rc);
+    }
+
+    if (gpio_is_valid(panel->reset_config.lcd_mode_sel_gpio)) {
+        bool out = true;
+
+        if ((panel->reset_config.mode_sel_state == MODE_SEL_DUAL_PORT)
+                || (panel->reset_config.mode_sel_state
+                    == MODE_GPIO_LOW))
+            out = false;
+        else if ((panel->reset_config.mode_sel_state
+                == MODE_SEL_SINGLE_PORT) ||
+                (panel->reset_config.mode_sel_state
+                 == MODE_GPIO_HIGH))
+            out = true;
+
+        rc = gpio_direction_output(
+            panel->reset_config.lcd_mode_sel_gpio, out);
+        if (rc)
+            pr_err("unable to set dir for mode gpio rc=%d\n", rc);
+    }
+exit:
+    return rc;
 }
 
 #if defined(CONFIG_DISPLAY_SAMSUNG)
@@ -519,6 +559,21 @@ error_disable_vregs:
 exit:
 	return rc;
 }
+#if defined(CONFIG_DISPLAY_SAMSUNG)
+void dsi_panel_pre_reset_unprepare(struct dsi_panel *panel)
+{
+
+	if (!ss_panel_attach_get(panel->panel_private)) {
+		LCD_INFO("PBA booting, skip to power off panel\n");
+		return ;
+	}
+
+	if (gpio_is_valid(panel->reset_config.reset_gpio))
+		gpio_set_value(panel->reset_config.reset_gpio, 0);
+
+	return ;
+}
+#endif
 
 #if defined(CONFIG_DISPLAY_SAMSUNG)
 int dsi_panel_power_off(struct dsi_panel *panel)
@@ -536,13 +591,13 @@ static int dsi_panel_power_off(struct dsi_panel *panel)
 		return 0;
 	}
 
-	if (vdd->dtsi_data.samsung_dsi_off_reset_delay) {
+	if (vdd->dtsi_data.samsung_dsi_off_reset_delay && !vdd->dtsi_data.samsung_reset_before_dsi_off) {
 		usleep_range(vdd->dtsi_data.samsung_dsi_off_reset_delay,
 				vdd->dtsi_data.samsung_dsi_off_reset_delay);
 	}
 #endif
 
-	if (gpio_is_valid(panel->reset_config.reset_gpio))
+	if (gpio_is_valid(panel->reset_config.reset_gpio) && !vdd->dtsi_data.samsung_reset_before_dsi_off)
 		gpio_set_value(panel->reset_config.reset_gpio, 0);
 
 	if (gpio_is_valid(panel->reset_config.disp_en_gpio))
@@ -1365,6 +1420,7 @@ static int dsi_panel_parse_misc_host_config(struct dsi_host_common_cfg *host,
 {
 	u32 val = 0;
 	int rc = 0;
+	bool panel_cphy_mode = false;
 
 	rc = utils->read_u32(utils->data, "qcom,mdss-dsi-t-clk-post", &val);
 	if (!rc) {
@@ -1387,6 +1443,11 @@ static int dsi_panel_parse_misc_host_config(struct dsi_host_common_cfg *host,
 
 	host->force_hs_clk_lane = utils->read_bool(utils->data,
 					"qcom,mdss-dsi-force-clock-lane-hs");
+	panel_cphy_mode = utils->read_bool(utils->data,
+					"qcom,panel-cphy-mode");
+	host->phy_type = panel_cphy_mode ? DSI_PHY_TYPE_CPHY
+						: DSI_PHY_TYPE_DPHY;
+
 	return 0;
 }
 
@@ -1897,6 +1958,7 @@ char *cmd_set_prop_map[SS_DSI_CMD_SET_MAX] = {
 
 	/* TX */
 	"TX_CMD_START not parsed from DTSI",
+	"samsung,mtp_write_sysfs_tx_cmds_revA",
 	"samsung,temp_dsc_tx_cmds_revA",
 	"samsung,display_on_tx_cmds_revA",
 	"samsung,display_off_tx_cmds_revA",
@@ -3885,12 +3947,14 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 	if (rc)
 		pr_err("failed to parse dfps configuration, rc=%d\n", rc);
 
-	if (!(panel->dfps_caps.dfps_support)) {
-		/* qsync and dfps are mutually exclusive features */
-		rc = dsi_panel_parse_qsync_caps(panel, of_node);
-		if (rc)
-			pr_err("failed to parse qsync features, rc=%d\n", rc);
-	}
+	rc = dsi_panel_parse_qsync_caps(panel, of_node);
+	if (rc)
+		pr_err("failed to parse qsync features, rc=%d\n", rc);
+
+	/* allow qsync support only if DFPS is with VFP approach */
+	if ((panel->dfps_caps.dfps_support) &&
+	    !(panel->dfps_caps.type == DSI_DFPS_IMMEDIATE_VFP))
+		panel->qsync_min_fps = 0;
 
 	rc = dsi_panel_parse_dyn_clk_caps(panel);
 	if (rc)
@@ -3918,7 +3982,6 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 		if (rc == -EPROBE_DEFER)
 			goto error;
 	}
-
 
 	rc = dsi_panel_parse_misc_features(panel);
 	if (rc)

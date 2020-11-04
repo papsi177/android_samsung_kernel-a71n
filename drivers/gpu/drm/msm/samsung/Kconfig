@@ -235,3 +235,17 @@ config PANEL_S6E3FA9_AMB667UM06_FHD
 	default n
 	---help---
 	LSI S6E3FA9 LDI 1080_2400 A71
+
+config PANEL_SW83106_FHD
+	depends on DISPLAY_SAMSUNG
+	bool "SEC SW83106 LDI"
+	default n
+	---help---
+	SEC SW83106 LDI 1080_2400 M51 Bring up
+
+config PANEL_SW83106_WM6676Z21_FHD
+	depends on DISPLAY_SAMSUNG
+	bool "SEC SW83106 LDI"
+	default n
+	---help---
+	SEC SW83106 LDI 1080_2400 M51 DV3

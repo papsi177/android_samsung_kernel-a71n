@@ -215,7 +215,7 @@ struct dsi_panel {
 	bool sync_broadcast_en;
 	int power_mode;
 	enum dsi_panel_physical_type panel_type;
-	
+
 #if defined(CONFIG_DISPLAY_SAMSUNG)
 	void *panel_private;
 	struct device_node *self_display_of_node;
@@ -340,6 +340,8 @@ int dsi_panel_power_off(struct dsi_panel *panel);
 int dsi_panel_tx_cmd_set(struct dsi_panel *panel, enum dsi_cmd_set_type type);
 int ss_dsi_panel_parse_cmd_sets(struct dsi_panel_cmd_set *cmd_sets,
 			struct dsi_panel *panel);
+void dsi_panel_pre_reset_unprepare(struct dsi_panel *panel);
+int dsi_panel_reset_prepare(struct dsi_panel *panel);
 #endif
 
 #endif /* _DSI_PANEL_H_ */

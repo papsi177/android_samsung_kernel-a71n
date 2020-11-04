@@ -419,6 +419,23 @@ static int dsi_update_mdnie_data(struct samsung_display_driver_data *vdd)
 		mdnie_data->dsi_scr_step_index = MDNIE_STEP2_INDEX;
 		mdnie_data->dsi_afc_size = 45;
 		mdnie_data->dsi_afc_index = 33;
+		
+		mdnie_data->support_mode = 1;
+		mdnie_data->support_scenario = 1;
+		mdnie_data->support_outdoor = 1;
+		mdnie_data->support_bypass = 1;
+		mdnie_data->support_accessibility = 1;
+		mdnie_data->support_sensorRGB = 1;
+		mdnie_data->support_whiteRGB = 1;
+		mdnie_data->support_mdnie_ldu = 1;
+		mdnie_data->support_night_mode = 1;
+		mdnie_data->support_color_lens = 0;
+		mdnie_data->support_hdr = 1;
+		mdnie_data->support_light_notification = 1;
+		mdnie_data->support_afc = 1;
+		mdnie_data->support_cabc = 0;
+		mdnie_data->support_hmt_color_temperature = 1;
+		mdnie_data->support_siliconworks = 0;
 
 		vdd->mdnie.mdnie_data = mdnie_data;
 
@@ -513,12 +530,12 @@ static struct dsi_panel_cmd_set *ss_acl_on(struct samsung_display_driver_data *v
 	}
 
 	if(vdd->br.cd_idx <= MAX_BL_PF_LEVEL)
-		pcmds->cmds[2].msg.tx_buf[1] = 0X03;	/* ACL 15% */
+		pcmds->cmds[4].msg.tx_buf[1] = 0X03;	/* ACL 15% */
 	else
-		pcmds->cmds[2].msg.tx_buf[1] = 0X01;	/* ACL 8% */
+		pcmds->cmds[4].msg.tx_buf[1] = 0X01;	/* ACL 8% */
 
 	LCD_INFO("gradual_acl: %d, acl per: 0x%x",
-			vdd->gradual_acl_val, pcmds->cmds[2].msg.tx_buf[1]);
+			vdd->gradual_acl_val, pcmds->cmds[4].msg.tx_buf[1]);
 
 	return pcmds;
 }

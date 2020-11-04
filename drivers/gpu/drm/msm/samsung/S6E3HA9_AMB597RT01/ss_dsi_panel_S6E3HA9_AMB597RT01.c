@@ -1371,6 +1371,23 @@ static int dsi_update_mdnie_data(struct samsung_display_driver_data *vdd)
 	mdnie_data->dsi_scr_step_index = MDNIE_STEP1_INDEX;
 	mdnie_data->dsi_afc_size = 45;
 	mdnie_data->dsi_afc_index = 33;
+	
+	mdnie_data->support_mode = 1;
+	mdnie_data->support_scenario = 1;
+	mdnie_data->support_outdoor = 1;
+	mdnie_data->support_bypass = 1;
+	mdnie_data->support_accessibility = 1;
+	mdnie_data->support_sensorRGB = 1;
+	mdnie_data->support_whiteRGB = 1;
+	mdnie_data->support_mdnie_ldu = 1;
+	mdnie_data->support_night_mode = 1;
+	mdnie_data->support_color_lens = 1;
+	mdnie_data->support_hdr = 1;
+	mdnie_data->support_light_notification = 1;
+	mdnie_data->support_afc = 1;
+	mdnie_data->support_cabc = 0;
+	mdnie_data->support_hmt_color_temperature = 1;
+	mdnie_data->support_siliconworks = 0;
 
 	vdd->mdnie.mdnie_data = mdnie_data;
 

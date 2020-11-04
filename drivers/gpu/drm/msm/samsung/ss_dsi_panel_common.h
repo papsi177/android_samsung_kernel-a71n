@@ -151,7 +151,7 @@ extern bool enable_pr_debug;
 #undef MDNIE_TUNING
 //#define MDNIE_TUNING
 
-#define MDNIE_TUNE_MAX_SIZE 6
+#define MDNIE_TUNE_MAX_SIZE 15
 //#define DYNAMIC_DSI_CLK
 
 extern unsigned int lpcharge;
@@ -363,6 +363,8 @@ struct samsung_display_dtsi_data {
 	bool samsung_esc_clk_128M;
 	bool samsung_osc_te_fitting;
 	bool samsung_support_factory_panel_swap;
+	bool samsung_reset_before_dsi_off; /*used for power off sequence Reset off-> (LP11->LP00) -> VCI(VPNL) off -> VDDI Off in panel SW83106 */
+	bool samsung_reset_after_dsi_on; /*used for power on sequence VDDI On -> VCI(VPNL) On -> min 1ms -> (LP00->LP11)  -> Reset On in panel SW83106 */
 	u32  samsung_power_on_reset_delay;
 	u32  samsung_dsi_off_reset_delay;
 	u32 samsung_lpm_init_delay;
@@ -660,6 +662,9 @@ struct panel_func {
 	/* DDI H/W Cursor */
 	int (*ddi_hw_cursor)(struct samsung_display_driver_data *vdd, int *input);
 
+	/* Fast Discharging (FD) */
+	int (*ub_fd_control)(struct samsung_display_driver_data *vdd, int enable);
+
 	/* COVER CONTROL */
 	void (*samsung_cover_control)(struct samsung_display_driver_data *vdd);
 
@@ -845,19 +850,26 @@ struct POC {
 	u32 rpos;
 	u32 rsize;
 
+	int start_addr;
 	int image_size;
 
 	/* ERASE */
+	int er_try_cnt;
+	int er_fail_cnt;
 	u32 erase_delay_us; /* usleep */
 	int erase_sector_addr_idx[3];
 
 	/* WRITE */
+	int wr_try_cnt;
+	int wr_fail_cnt;
 	u32 write_delay_us; /* usleep */
 	int write_loop_cnt;
 	int write_data_size;
 	int write_addr_idx[3];
 
 	/* READ */
+	int rd_try_cnt;
+	int rd_fail_cnt;
 	u32 read_delay_us;	/* usleep */
 	int read_addr_idx[3];
 
@@ -870,10 +882,15 @@ struct POC {
 	int (*poc_read)(struct samsung_display_driver_data *vdd, u8 *buf, u32 pos, u32 size);
 	int (*poc_erase)(struct samsung_display_driver_data *vdd, u32 erase_pos, u32 erase_size, u32 target_pos);
 
+	int (*poc_open)(struct samsung_display_driver_data *vdd);
+	int (*poc_release)(struct samsung_display_driver_data *vdd);
+
 	void (*poc_comp)(struct samsung_display_driver_data *vdd);
 	int (*check_read_case)(struct samsung_display_driver_data *vdd);
 
 	int read_case;
+
+	bool need_sleep_in;
 };
 
 #define GCT_RES_CHECKSUM_PASS	(1)
@@ -1014,6 +1031,13 @@ struct ub_con_detect {
 	unsigned long irqflag;
 	bool enabled;
 	int ub_con_cnt;
+};
+
+struct ub_fast_discharge {
+	int gpio;
+	bool enabled;
+	int fd_on_count;
+	int fd_off_count;
 };
 
 /*
@@ -1240,6 +1264,10 @@ struct samsung_display_driver_data {
 	//struct rf_info rf_info;
 	struct dyn_mipi_clk dyn_mipi_clk;
 
+	/* ffc_tx_cmds's level keys are different for each panel, so cmds line position is different.
+	    ex) FA9 used  F0 and FC level key, others used only F0 Level key. */
+	int ffc_cmds_line_position; /* Default Vaule : 1 */
+
 	/*
 	 *  GCT
 	 */
@@ -1321,6 +1349,9 @@ struct samsung_display_driver_data {
 
 	/* UB CON DETECT */
 	struct ub_con_detect ub_con_det;
+
+	/* UB FD GPIO*/
+	struct ub_fast_discharge ub_fd;
 };
 
 extern struct list_head vdds_list;
@@ -1402,6 +1433,7 @@ int ss_dyn_mipi_clk_tx_ffc(struct samsung_display_driver_data *vdd);
 
 /* read mtp */
 void ss_read_mtp(struct samsung_display_driver_data *vdd, int addr, int len, int pos, u8 *buf);
+void ss_write_mtp(struct samsung_display_driver_data *vdd, int len, u8 *buf);
 
 /* Other line panel support */
 #define MAX_READ_LINE_SIZE 256

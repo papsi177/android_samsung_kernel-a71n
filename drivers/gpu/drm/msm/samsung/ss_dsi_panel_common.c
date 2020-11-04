@@ -559,7 +559,7 @@ static int ss_find_dyn_mipi_clk_timing_idx(struct samsung_display_driver_data *v
 	rat = vdd->dyn_mipi_clk.rf_info.rat;
 	band = vdd->dyn_mipi_clk.rf_info.band;
 	arfcn = vdd->dyn_mipi_clk.rf_info.arfcn;
-	
+
 	for (loop = 0 ; loop < sel_table.tab_size ; loop++) {
 		if ((rat == sel_table.rat[loop]) && (band == sel_table.band[loop])) {
 			if ((arfcn >= sel_table.from[loop]) && (arfcn <= sel_table.end[loop])) {
@@ -664,11 +664,12 @@ int ss_dyn_mipi_clk_tx_ffc(struct samsung_display_driver_data *vdd)
 	struct dsi_panel_cmd_set *ffc_set;
 	struct dsi_panel_cmd_set *dyn_ffc_set;
 	int idx;
+	int ffc_cmds_line_position = 1;
 
 	mutex_lock(&vdd->dyn_mipi_clk.dyn_mipi_lock);
 	idx = ss_find_dyn_mipi_clk_timing_idx(vdd);
 	mutex_unlock(&vdd->dyn_mipi_clk.dyn_mipi_lock);
-	
+
 	if (idx < 0 ) {
 		LCD_ERR("Failed to find MIPI clock timing (%d)\n", idx);
 		return -EINVAL;
@@ -683,9 +684,12 @@ int ss_dyn_mipi_clk_tx_ffc(struct samsung_display_driver_data *vdd)
 		return -EINVAL;
 	}
 
-	memcpy(ffc_set->cmds[1].msg.tx_buf, dyn_ffc_set->cmds[idx].msg.tx_buf, ffc_set->cmds[1].msg.tx_len);
+	ffc_cmds_line_position = vdd->ffc_cmds_line_position;
+	memcpy(ffc_set->cmds[ffc_cmds_line_position].msg.tx_buf, dyn_ffc_set->cmds[idx].msg.tx_buf, ffc_set->cmds[ffc_cmds_line_position].msg.tx_len);
+
 	ss_send_cmd(vdd, TX_FFC);
-	LCD_INFO("--- clk idx: %d, tx FFC\n", idx);
+
+	LCD_INFO("--- clk idx: %d, ffc_cmds_line_position : %d tx FFC\n", idx, ffc_cmds_line_position);
 
 	return 0;
 }
@@ -2234,6 +2238,9 @@ int ss_panel_off_post(struct samsung_display_driver_data *vdd)
 	vdd->self_disp.time_set = false;
 	vdd->self_disp.on = false;
 
+	if (vdd->finger_mask)
+		vdd->finger_mask = false;
+
 	LCD_INFO("-\n");
 	SS_XLOG(SS_XLOG_FINISH);
 
@@ -2687,7 +2694,7 @@ static void ss_panel_parse_dt_ub_con(struct device_node *np,
 
 	ub_con_det->gpio = of_get_named_gpio(np,
 			"samsung,ub-con-det", 0);
-	
+
 	LCD_INFO("request ub_con_det irq for ndx%d\n", vdd->ndx);
 
 	if (gpio_is_valid(ub_con_det->gpio)) {
@@ -2712,6 +2719,40 @@ static void ss_panel_parse_dt_ub_con(struct device_node *np,
 	if (ret)
 		LCD_ERR("Failed to request_irq, ret=%d\n", ret);
 
+	return;
+}
+
+static void ss_panel_parse_dt_ub_fd(struct device_node *np,
+		struct samsung_display_driver_data *vdd)
+{
+	struct ub_fast_discharge *ub_fd;
+	int ret;
+	u32 tmp[2];
+
+	ub_fd = &vdd->ub_fd;
+
+	ub_fd->gpio = of_get_named_gpio(np, "samsung,ub-fd-gpio", 0);
+
+	LCD_INFO("request ub_fd gpio(%d) for ndx%d\n", ub_fd->gpio, vdd->ndx);
+
+	if (gpio_is_valid(ub_fd->gpio)) {
+		ret = gpio_request(ub_fd->gpio, "UB_FD_GPIO");
+		if (ret) {
+			LCD_INFO("[ub_fd ndx%d] fail to gpio_request.. %d\n", vdd->ndx, ret);
+			ub_fd->enabled = 0;
+		} else {
+			ub_fd->enabled = 1;
+			ret = of_property_read_u32(np, "samsung,ub-fd-on-count", tmp);
+			ub_fd->fd_on_count = (!ret ? tmp[0] : 25);
+			ret = of_property_read_u32(np, "samsung,ub-fd-off-count", tmp);
+			ub_fd->fd_off_count = (!ret ? tmp[0] : 26);
+			LCD_INFO("[ub_fd ndx%d] gpio : %d, on_cnt=%d, off_cnt=%d\n", vdd->ndx, ub_fd->gpio, ub_fd->fd_on_count, ub_fd->fd_off_count);
+		}
+	} else {
+		LCD_ERR("fail to gpio_request\n");
+		ub_fd->enabled = 0;
+		return;
+	}
 	return;
 }
 
@@ -3157,6 +3198,9 @@ static void ss_panel_parse_dt(struct samsung_display_driver_data *vdd)
 	LCD_ERR("LP11 init %s\n",
 		vdd->dtsi_data.samsung_lp11_init ? "enabled" : "disabled");
 
+	vdd->dtsi_data.samsung_reset_before_dsi_off = of_property_read_bool(np, "samsung,mdss-reset-before-dsi-off");
+	vdd->dtsi_data.samsung_reset_after_dsi_on = of_property_read_bool(np, "samsung,mdss-reset-after-dsi-on");
+
 	rc = of_property_read_u32(np, "samsung,mdss-power-on-reset-delay-us", tmp);
 	vdd->dtsi_data.samsung_power_on_reset_delay = (!rc ? tmp[0] : 0);
 
@@ -3365,7 +3409,7 @@ static void ss_panel_parse_dt(struct samsung_display_driver_data *vdd)
 	LCD_INFO("vdd->self_disp.is_support = %d\n", vdd->self_disp.is_support);
 
 	if (vdd->self_disp.is_support) {
-		/* Self Mask Check CRC data */	
+		/* Self Mask Check CRC data */
 		data = of_get_property(np, "samsung,mask_crc_pass_data", &len);
 		if (!data)
 			LCD_ERR("fail to get samsung,mask_crc_pass_data .. \n");
@@ -3517,6 +3561,10 @@ static void ss_panel_parse_dt(struct samsung_display_driver_data *vdd)
 		vdd->dyn_mipi_clk.notifier.priority = 0;
 		vdd->dyn_mipi_clk.notifier.notifier_call = ss_rf_info_notify_callback;
 		register_dev_ril_bridge_event_notifier(&vdd->dyn_mipi_clk.notifier);
+
+		rc = of_property_read_u32(np, "samsung,ffc_cmds_line_position", tmp);
+		vdd->ffc_cmds_line_position = (!rc ? tmp[0] : 1);
+		LCD_INFO("ffc_cmds_line_position (%d) \n", vdd->ffc_cmds_line_position);
 	}
 
 	ss_panel_parse_dt_bright_tables(np, vdd);
@@ -3550,6 +3598,7 @@ static void ss_panel_parse_dt(struct samsung_display_driver_data *vdd)
 	vdd->dtsi_data.samsung_delayed_display_on = (!rc ? tmp[0] : 0);
 
 	ss_panel_parse_dt_ub_con(np, vdd);
+	ss_panel_parse_dt_ub_fd(np, vdd);
 	ss_panel_parse_dt_esd(np, vdd);
 	ss_panel_pbaboot_config(np, vdd);
 
@@ -4453,7 +4502,7 @@ static void set_normal_br_values(struct samsung_display_driver_data *vdd)
 
 		LCD_INFO("[%d] pac_cd_idx (%d) cd_idx (%d) cd (%d) interpolation_cd (%d)\n",
 			p, vdd->br.pac_cd_idx, vdd->br.cd_idx, vdd->br.cd_level, vdd->br.interpolation_cd);
-	} else { 
+	} else {
 		if (vdd->br.gamma_mode2_support) {
 			vdd->br.gamma_mode2_cd = table->gamma_mode2_cd[p];
 			LCD_INFO("[%d] cd_idx (%d) cd (%d) panel_real_cd (%d)\n",
@@ -5379,6 +5428,47 @@ void ss_read_mtp(struct samsung_display_driver_data *vdd, int addr, int len, int
 	vdd->exclusive_tx.enable = 0;
 	wake_up_all(&vdd->exclusive_tx.ex_tx_waitq);
 	mutex_unlock(&vdd->exclusive_tx.ex_tx_lock);
+
+	return;
+}
+
+void ss_write_mtp(struct samsung_display_driver_data *vdd, int len, u8 *buf)
+{
+	struct dsi_panel_cmd_set *tx_cmds;
+
+	if (IS_ERR_OR_NULL(vdd)) {
+		LCD_ERR("no vdd");
+		return;
+	}
+
+	if (!ss_is_ready_to_send_cmd(vdd)) {
+		LCD_ERR("Panel is not ready. Panel State(%d)\n", vdd->panel_state);
+		return;
+	}
+
+	if (len > 0xFF) {
+		LCD_ERR("unvalind para len(%d)\n", len);
+		return;
+	}
+
+	tx_cmds = ss_get_cmds(vdd, TX_MTP_WRITE_SYSFS);
+	if (SS_IS_CMDS_NULL(tx_cmds)) {
+		LCD_ERR("No cmds for TX_MTP_WRITE_SYSFS.. \n");
+		return;
+	}
+
+	tx_cmds->cmds[0].msg.tx_len = len;
+	tx_cmds->cmds[0].msg.tx_buf = buf;
+
+	ss_send_cmd(vdd, TX_LEVEL0_KEY_ENABLE);
+	ss_send_cmd(vdd, TX_LEVEL1_KEY_ENABLE);
+	ss_send_cmd(vdd, TX_LEVEL2_KEY_ENABLE);
+
+	ss_send_cmd(vdd, TX_MTP_WRITE_SYSFS);
+
+	ss_send_cmd(vdd, TX_LEVEL2_KEY_DISABLE);
+	ss_send_cmd(vdd, TX_LEVEL1_KEY_DISABLE);
+	ss_send_cmd(vdd, TX_LEVEL0_KEY_DISABLE);
 
 	return;
 }
