@@ -2011,6 +2011,9 @@ struct sdhci_msm_pltfm_data *sdhci_msm_populate_pdata(struct device *dev,
 	if (!pdata)
 		goto out;
 
+	device_property_read_u32(dev, "post-power-on-delay-ms",
+                                &msm_host->mmc->ios.power_delay_ms);
+
 	pdata->status_gpio = of_get_named_gpio_flags(np, "cd-gpios", 0, &flags);
 	if (gpio_is_valid(pdata->status_gpio) && !(flags & OF_GPIO_ACTIVE_LOW))
 		pdata->caps2 |= MMC_CAP2_CD_ACTIVE_HIGH;
@@ -2577,6 +2580,7 @@ static int sdhci_msm_setup_vreg(struct sdhci_msm_pltfm_data *pdata,
 				ret = sdhci_msm_vreg_disable(vreg_table[i]);
 				if (gpio_is_valid(pdata->tflash_en_gpio)) {
 					if (gpio_get_value(pdata->tflash_en_gpio)) {
+						mdelay(2);
 						gpio_direction_output(pdata->tflash_en_gpio, 0);
 						pr_err("tflash is %sabled(%d).\n",
 								gpio_get_value(pdata->tflash_en_gpio) ? "en" : "dis",

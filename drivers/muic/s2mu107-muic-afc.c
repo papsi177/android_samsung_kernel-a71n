@@ -312,6 +312,7 @@ static void _s2mu107_hv_muic_reset(struct s2mu107_muic_data *muic_data)
 	cancel_delayed_work(&muic_data->qc_retry_work);
 }
 
+#if !IS_ENABLED(CONFIG_SEC_FACTORY)
 static bool _s2mu107_hv_muic_check_afc_enabled(struct s2mu107_muic_data *muic_data)
 {
 	char *str = NULL;
@@ -346,6 +347,7 @@ static bool _s2mu107_hv_muic_check_afc_enabled(struct s2mu107_muic_data *muic_da
 
 	return true;
 }
+#endif
 
 static void _s2mu107_hv_muic_dcp_charger_attach(struct s2mu107_muic_data *muic_data)
 {
@@ -403,15 +405,13 @@ static void s2mu107_if_hv_muic_fast_charge_adaptor(void *mdata)
 		s2mu107_hv_muic_set_afc_tx_data(muic_data, muic_data->tx_data);
 		muic_data->mrxrdy_cnt = 0;
 		muic_data->mping_cnt = 0;
-		//s2mu107_hv_muic_handle_attach(muic_data, ATTACHED_DEV_AFC_CHARGER_PREPARE_MUIC);
+		s2mu107_hv_muic_handle_attach(muic_data, ATTACHED_DEV_AFC_CHARGER_PREPARE_MUIC);
 	}
 	
 #if !IS_ENABLED(CONFIG_SEC_FACTORY)
 	afc_enabled = _s2mu107_hv_muic_check_afc_enabled(muic_data);
 #endif
 	if (afc_enabled) {
-		if (muic_data->is_hvcharger_detected == false)
-			s2mu107_hv_muic_handle_attach(muic_data, ATTACHED_DEV_AFC_CHARGER_PREPARE_MUIC);
 		/* 1st mping */
 		s2mu107_hv_muic_send_mping(muic_data);
 	}
@@ -845,8 +845,12 @@ static irqreturn_t s2mu107_hv_muic_vdnmon_isr(int irq, void *data)
 	vdnmon = s2mu107_hv_muic_get_vdnmon_status(muic_data);
 	pr_info("%s vdnmon(%s)\n", __func__, (vdnmon ? "High" : "Low"));
 
-	if (muic_data->is_dp_drive && !vdnmon) {
+	if (muic_data->is_dp_drive && !vdnmon && muic_data->pdata->afc_disable == false) {
 		muic_core_hv_state_manager(muic_pdata, HV_TRANS_VDNMON_LOW);
+	}
+	else {
+		pr_err("%s afc blocked is_dp_drive:%d, afc_disable:%d\n",
+     __func__, muic_data->is_dp_drive, muic_data->pdata->afc_disable);
 	}
 
 	mutex_unlock(&muic_data->afc_mutex);

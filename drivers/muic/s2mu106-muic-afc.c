@@ -319,6 +319,7 @@ static void _s2mu106_hv_muic_reset(struct s2mu106_muic_data *muic_data)
 	cancel_delayed_work(&muic_data->qc_retry_work);
 }
 
+#if !IS_ENABLED(CONFIG_SEC_FACTORY)
 static bool _s2mu106_hv_muic_check_afc_enabled(struct s2mu106_muic_data *muic_data)
 {
 	char *str = NULL;
@@ -340,10 +341,6 @@ static bool _s2mu106_hv_muic_check_afc_enabled(struct s2mu106_muic_data *muic_da
 	} else if (muic_if->is_afc_pdic_ready == false) {
 		str = "VBUS-CC Short";
 #endif
-#if defined(CONFIG_LEDS_S2MU106_FLASH)
-	} else if (muic_data->is_requested_step_down == true) {
-		str = "Flash from CAM";
-#endif
 	}
 
 	if (str) {
@@ -353,6 +350,7 @@ static bool _s2mu106_hv_muic_check_afc_enabled(struct s2mu106_muic_data *muic_da
 
 	return true;
 }
+#endif
 
 static void _s2mu106_hv_muic_dcp_charger_attach(struct s2mu106_muic_data *muic_data)
 {
@@ -411,15 +409,20 @@ static void s2mu106_if_hv_muic_fast_charge_adaptor(void *mdata)
 		s2mu106_hv_muic_set_afc_tx_data(muic_data, muic_data->tx_data);
 		muic_data->mrxrdy_cnt = 0;
 		muic_data->mping_cnt = 0;
-		//s2mu106_hv_muic_handle_attach(muic_data, ATTACHED_DEV_AFC_CHARGER_PREPARE_MUIC);
 	}
 
 #if !IS_ENABLED(CONFIG_SEC_FACTORY)
 	afc_enabled = _s2mu106_hv_muic_check_afc_enabled(muic_data);
 #endif
 	if (afc_enabled) {
-		if (muic_data->is_hvcharger_detected == false)
-			s2mu106_hv_muic_handle_attach(muic_data, ATTACHED_DEV_AFC_CHARGER_PREPARE_MUIC);
+		s2mu106_hv_muic_handle_attach(muic_data, ATTACHED_DEV_AFC_CHARGER_PREPARE_MUIC);
+		msleep(100);
+#if defined(CONFIG_LEDS_S2MU106_FLASH)
+		if (muic_data->is_requested_step_down == true) {
+			pr_err("%s skip to boost: flash is working\n ", __func__);
+			return;
+		}
+#endif
 		/* 1st mping */
 		s2mu106_hv_muic_send_mping(muic_data);
 	}
@@ -555,6 +558,9 @@ static void s2mu106_hv_muic_set_ready(struct s2mu106_muic_data* muic_data)
 		if (muic_pdata->hv_state == HV_STATE_IDLE) {
 			_s2mu106_hv_muic_dcp_charger_attach(muic_data);
 		}
+		else if (muic_pdata->hv_state == HV_STATE_FAST_CHARGE_ADAPTOR) {
+            muic_core_hv_state_manager(muic_pdata, HV_TRANS_FAST_CHARGE_REOPEN);
+        }
 		break;
 	case ATTACHED_DEV_AFC_CHARGER_PREPARE_MUIC:
 		if (muic_pdata->hv_state == HV_STATE_FAST_CHARGE_ADAPTOR) {
@@ -857,7 +863,7 @@ static irqreturn_t s2mu106_hv_muic_vdnmon_isr(int irq, void *data)
 	vdnmon = s2mu106_hv_muic_get_vdnmon_status(muic_data);
 	pr_info("%s vdnmon(%s)\n", __func__, (vdnmon ? "High" : "Low"));
 
-	if (muic_data->is_dp_drive && !vdnmon) {
+	if (muic_data->is_dp_drive && !vdnmon && muic_data->pdata->afc_disable == false) {
 		msleep(110);
 		vbus = s2mu106_i2c_read_byte(muic_data->i2c, S2MU106_REG_DEVICE_APPLE);
 		vbus &= DEVICE_APPLE_VBUS_WAKEUP_MASK;
@@ -865,6 +871,10 @@ static irqreturn_t s2mu106_hv_muic_vdnmon_isr(int irq, void *data)
 			muic_core_hv_state_manager(muic_pdata, HV_TRANS_VDNMON_LOW);
 		else
 			pr_err("%s skip to handle vdnmon: invalid vbus\n", __func__);
+	}
+	else {
+		pr_err("%s afc blocked is_dp_drive:%d, afc_disable:%d\n",
+     __func__, muic_data->is_dp_drive, muic_data->pdata->afc_disable);
 	}
 
 	mutex_unlock(&muic_data->afc_mutex);

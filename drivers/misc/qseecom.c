@@ -7896,7 +7896,7 @@ static long qseecom_ioctl(struct file *file,
 		if ((data->type != QSEECOM_GENERIC) &&
 			(data->type != QSEECOM_CLIENT_APP)) {
 			pr_err("app loaded query req: invalid handle (%d)\n",
-				data->type);
+								data->type);
 			ret = -EINVAL;
 			break;
 		}

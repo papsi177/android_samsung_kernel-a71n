@@ -95,4 +95,3 @@ obj-$(CONFIG_OKL4_LINK_SHBUF)    += okl4-link-shbuf.o
 
 # for dev-ril-bridge
 obj-$(CONFIG_DEV_RIL_BRIDGE)	+= dev_ril_bridge/
-obj-$(CONFIG_QSEECOM)  += tzic64.o

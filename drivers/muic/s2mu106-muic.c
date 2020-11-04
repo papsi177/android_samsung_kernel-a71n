@@ -1487,23 +1487,17 @@ static int s2mu106_muic_detect_dev_bc1p2(struct s2mu106_muic_data *muic_data)
 			pr_info("SDP_1P8S=>USB DETECTED\n");
 			muic_data->new_dev = ATTACHED_DEV_USB_MUIC;
 #else
-			pr_info("SDP_1P8S DETECTED\n");
-#if defined(CONFIG_MUIC_SUPPORT_PRSWAP)
-            _s2mu106_muic_set_chg_det(muic_data, MUIC_DISABLE);
-#endif
-#if IS_ENABLED(CONFIG_S2MU106_TYPEC_WATER)
-			if (muic_data->rescan_cnt > 1) {
+			if (muic_data->rescan_cnt >= 1) {
+				pr_info("SDP_1P8S DETECTED\n");
 				muic_data->new_dev = ATTACHED_DEV_TIMEOUT_OPEN_MUIC;
+#if defined(CONFIG_MUIC_SUPPORT_PRSWAP)
+				_s2mu106_muic_set_chg_det(muic_data, MUIC_DISABLE);
+#endif
+				return S2MU106_DETECT_DONE;
 			} else {
-				schedule_delayed_work(&muic_data->dcd_recheck, msecs_to_jiffies(600));
+				schedule_delayed_work(&muic_data->dcd_recheck, msecs_to_jiffies(100));
 				return S2MU106_DETECT_SKIP;
 			}
-#else
-			muic_data->new_dev = ATTACHED_DEV_TIMEOUT_OPEN_MUIC;
-#if defined(CONFIG_MUIC_SUPPORT_PRSWAP)
-			_s2mu106_muic_set_chg_det(muic_data, MUIC_DISABLE);
-#endif
-#endif
 		}
 		break;
 	default:
@@ -1544,7 +1538,7 @@ static int s2mu106_muic_detect_dev_bc1p2(struct s2mu106_muic_data *muic_data)
 		muic_data->new_dev = ATTACHED_DEV_TA_MUIC;
 		muic_data->afc_check = false;
 		pr_info("CHG_TYPE DETECTED\n");
-		if (muic_data->rescan_cnt > 1) {
+		if (muic_data->rescan_cnt >= 1) {
 			muic_data->new_dev = ATTACHED_DEV_TA_MUIC;
 			muic_data->afc_check = false;
 		} else {
@@ -2234,6 +2228,7 @@ static irqreturn_t s2mu106_muic_detach_isr(int irq, void *data)
 	if (s2mu106_muic_is_opmode_typeC(muic_data)) {
 		if (!muic_core_get_ccic_cable_state(muic_data->pdata)) {
 			muic_core_handle_detach(muic_data->pdata);
+			muic_data->rescan_cnt = 0;
 #if IS_ENABLED(CONFIG_S2MU106_TYPEC_WATER)
 			s2mu106_muic_handle_legacy_detach(muic_data);
 #endif
@@ -2303,11 +2298,6 @@ static irqreturn_t s2mu106_muic_vbus_on_isr(int irq, void *data)
 	}
 #else
 	muic_pdata->vbvolt = muic_data->vbvolt = _s2mu106_muic_get_vbus_state(muic_data);
-	if (s2mu106_muic_is_opmode_typeC(muic_data)) {
-		cancel_delayed_work(&muic_data->rescan_validity_checker);
-		schedule_delayed_work(&muic_data->rescan_validity_checker,
-			msecs_to_jiffies(1200));
-	}
 #endif
 
 #if IS_ENABLED(CONFIG_HICCUP_CHARGER) && IS_ENABLED(CONFIG_S2MU106_TYPEC_WATER)
@@ -2371,9 +2361,7 @@ static irqreturn_t s2mu106_muic_vbus_off_isr(int irq, void *data)
 	}
 
 	muic_pdata->vbvolt = muic_data->vbvolt = _s2mu106_muic_get_vbus_state(muic_data);
-#if IS_ENABLED(CONFIG_S2MU106_TYPEC_WATER)
 	muic_data->rescan_cnt = 0;
-#endif
 
 #if IS_ENABLED(CONFIG_VBUS_NOTIFIER)
 	vbus_notifier_handle(STATUS_VBUS_LOW);
@@ -2404,6 +2392,9 @@ static irqreturn_t s2mu106_muic_vbus_off_isr(int irq, void *data)
 			_s2mu106_muic_set_int_mask(muic_data, 0x3, 0x0, 0x0, 0x0);
 #endif
 			muic_core_handle_detach(muic_data->pdata);
+#if defined(CONFIG_MUIC_SUPPORT_PRSWAP)
+			_s2mu106_muic_set_chg_det(muic_data, MUIC_ENABLE);
+#endif
 		}
 	}
 #endif
@@ -2751,6 +2742,7 @@ static void s2mu106_muic_init_interface(struct s2mu106_muic_data *muic_data,
 
 	muic_if->muic_data = (void *)muic_data;
 
+	muic_if->set_com_to_open_with_vbus = s2mu106_if_com_to_open;
 	muic_if->set_com_to_open = s2mu106_if_com_to_open;
 	muic_if->set_switch_to_usb = s2mu106_if_com_to_usb;
 	muic_if->set_com_to_otg = s2mu106_if_com_to_usb;
