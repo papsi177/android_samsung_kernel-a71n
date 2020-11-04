@@ -69,7 +69,7 @@ struct msm_tile {
 #if defined(CONFIG_SEC_A70Q_PROJECT) || defined(CONFIG_SEC_A70S_PROJECT)
 #define MST_GPIO_D_EN 38
 #define MST_GPIO_D_DATA 37
-#elif defined(CONFIG_SEC_A90Q_PROJECT) || defined(CONFIG_SEC_A70SQ_PROJECT) || defined(CONFIG_SEC_A71_PROJECT)
+#elif defined(CONFIG_SEC_A90Q_PROJECT) || defined(CONFIG_SEC_A70SQ_PROJECT) || defined(CONFIG_SEC_A71_PROJECT) || defined(CONFIG_SEC_M41_PROJECT) || defined(CONFIG_SEC_M51_PROJECT)
 #define MST_GPIO_D_EN 84
 #define MST_GPIO_D_DATA 83
 #endif
@@ -1856,7 +1856,7 @@ static void msm_gpio_setup_dir_connects(struct msm_pinctrl *pctrl)
 		if (!gpio_in->init)
 			continue;
 
-		irq = irq_find_mapping(pctrl->chip.irqdomain, gpio_in->gpio);
+		irq = irq_create_mapping(pctrl->chip.irqdomain, gpio_in->gpio);
 		d = irq_get_irq_data(irq);
 		if (!d)
 			continue;
