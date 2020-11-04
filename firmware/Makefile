@@ -28,7 +28,7 @@ fw-external-$(CONFIG_TOUCHSCREEN_IST40XX) += tsp_imagis/ist40xx_r1.bin tsp_imagi
 						
 fw-external-$(CONFIG_TOUCHSCREEN_MELFAS_MSS100) += tsp_melfas/mss100_a70s.bin
 
-fw-external-$(CONFIG_TOUCHSCREEN_SEC_TS_Y771) += tsp_sec/y771_a71.bin tsp_sec/y771_a71_1l.bin
+fw-external-$(CONFIG_TOUCHSCREEN_SEC_TS_Y771) += tsp_sec/y771_a71.bin tsp_sec/y771_a71_1l.bin tsp_sec/y771_m51.bin
 
 ifdef CONFIG_SEC_A70Q_PROJECT
 ifdef CONFIG_SEC_A70Q_USA_PROJECT
@@ -41,8 +41,21 @@ else ifdef CONFIG_SEC_A70SQ_PROJECT
 fw-external-$(CONFIG_SENSORS_A96T3X6) += abov/a96t356_a70sq.bin
 fw-external-$(CONFIG_SENSORS_A96T3X6_SUB) += abov/a96t356_a70sq_sub.bin
 else ifdef CONFIG_SEC_A71_PROJECT
+ifdef CONFIG_SEC_A71_CAN_PROJECT
+fw-external-$(CONFIG_SENSORS_A96T3X6) += abov/a96t356_a71_can.bin
+fw-external-$(CONFIG_SENSORS_A96T3X6_SUB) += abov/a96t356_a71_sub_can.bin
+else
 fw-external-$(CONFIG_SENSORS_A96T3X6) += abov/a96t356_a71.bin
 fw-external-$(CONFIG_SENSORS_A96T3X6_SUB) += abov/a96t356_a71_sub.bin
+endif
+else ifdef CONFIG_SEC_M41_PROJECT
+fw-external-$(CONFIG_SENSORS_A96T3X6) += abov/a96t356_m41.bin
+fw-external-$(CONFIG_SENSORS_A96T3X6_SUB) += abov/a96t356_m41_sub.bin
+else ifdef CONFIG_SEC_M51_PROJECT
+fw-external-$(CONFIG_SENSORS_A96T3X6) += abov/a96t356_m51.bin
+fw-external-$(CONFIG_SENSORS_A96T3X6_SUB) += abov/a96t356_m51_sub.bin
+else ifdef CONFIG_SEC_A70S_PROJECT
+fw-external-$(CONFIG_SENSORS_A96T3X6) += abov/a96t346_a70q_eur.bin
 endif
 
 fw-external-$(CONFIG_TOUCHSCREEN_NOVATEK_NT36672) += tsp_novatek/nt36672_a60.bin tsp_novatek/nt36672_m40.bin \
@@ -51,8 +64,10 @@ fw-external-$(CONFIG_TOUCHSCREEN_NOVATEK_NT36672) += tsp_novatek/nt36672_a60.bin
 #touch based grip sensor
 fw-shipped-$(CONFIG_SENSORS_TC3XXK_A60) += coreriver/tc305k_a60_grip.fw
 
-fw-shipped-$(CONFIG_FIVE_TEE_DRIVER) += five.b00 five.b01 five.b02 five.b03 \
-				  five.b04 five.b05 five.b06 five.b07 five.mdt
+# FIVE
+ifeq ($(CONFIG_FIVE_TEE_DRIVER),y)
+include $(srctree)/firmware/five/Makefile
+endif
 
 fw-shipped-all := $(fw-shipped-y) $(fw-shipped-m) $(fw-shipped-)
 
