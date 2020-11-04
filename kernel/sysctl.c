@@ -374,6 +374,24 @@ static struct ctl_table kern_table[] = {
 		.extra2		= &three,
 	},
 	{
+		.procname	= "sched_conservative_pl",
+		.data		= &sysctl_sched_conservative_pl,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{
+		.procname	= "sched_many_wakeup_threshold",
+		.data		= &sysctl_sched_many_wakeup_threshold,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &two,
+		.extra2		= &one_thousand,
+	},
+	{
 		.procname	= "sched_walt_rotate_big_tasks",
 		.data		= &sysctl_sched_walt_rotate_big_tasks,
 		.maxlen		= sizeof(unsigned int),
@@ -1527,6 +1545,14 @@ static struct ctl_table vm_table[] = {
 #else
 		.extra2		= &one_hundred,
 #endif
+	},
+	{
+		.procname	= "mmap_readaround_limit",
+		.data		= &mmap_readaround_limit,
+		.maxlen		= sizeof(mmap_readaround_limit),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
 	},
 	{
 		.procname       = "want_old_faultaround_pte",
