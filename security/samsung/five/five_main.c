@@ -40,13 +40,14 @@
 #include "five_porting.h"
 #include "five_cache.h"
 #include "five_dmverity.h"
+#include "five_dsms.h"
 
 static const bool unlink_on_error;	// false
 
 static const bool check_dex2oat_binary = true;
 static const bool check_memfd_file = true;
 
-static struct file *memfd_file;
+static struct file *memfd_file __ro_after_init;
 
 static struct workqueue_struct *g_five_workqueue;
 
@@ -124,6 +125,36 @@ error:
 static inline int is_five_enabled(void)
 {
 	return five_enabled;
+}
+
+int five_fcntl_debug(struct file *file, void __user *argp)
+{
+	struct inode *inode;
+	struct five_stat stat = {0};
+	struct integrity_iint_cache *iint;
+
+	if (unlikely(!file || !argp))
+		return -EINVAL;
+
+	inode = file_inode(file);
+
+	inode_lock(inode);
+	iint = integrity_inode_get(inode);
+	if (unlikely(!iint)) {
+		inode_unlock(inode);
+		return -ENOMEM;
+	}
+
+	stat.cache_status = five_get_cache_status(iint);
+	stat.cache_iversion = inode_query_iversion(iint->inode);
+	stat.inode_iversion = inode_query_iversion(inode);
+
+	inode_unlock(inode);
+
+	if (unlikely(copy_to_user(argp, &stat, sizeof(stat))))
+		return -EFAULT;
+
+	return 0;
 }
 #else
 static int __init init_fs(void)
@@ -431,22 +462,33 @@ static inline bool is_dex2oat_binary(const struct file *file)
 {
 	const char *pathname = NULL;
 	char *pathbuf = NULL;
-	const char dex2oat_full_path[] =
-		"/apex/com.android.runtime/bin/dex2oat";
+	const char * const dex2oat_full_path[] = {
+		"/apex/com.android.art/bin/dex2oat",	/* R OS */
+		"/apex/com.android.runtime/bin/dex2oat"	/* Q OS */
+	};
 	bool res = false;
+	size_t i;
 
 	if (!file || !file->f_path.dentry)
 		return false;
 
 	if (strncmp(file->f_path.dentry->d_iname, "dex2oat",
-			sizeof("dex2oat") - 1))
+			sizeof("dex2oat")))
 		return false;
 
 	pathname = five_d_path(&file->f_path, &pathbuf);
-	if (pathname && !strncmp(pathname, dex2oat_full_path,
-					sizeof(dex2oat_full_path) - 1))
-		res = true;
+	if (!pathname)
+		goto exit;
 
+	for (i = 0; i < ARRAY_SIZE(dex2oat_full_path); ++i) {
+		if (!strncmp(pathname, dex2oat_full_path[i],
+					strlen(dex2oat_full_path[i]) + 1)) {
+			res = true;
+			break;
+		}
+	}
+
+exit:
 	if (pathbuf)
 		__putname(pathbuf);
 
@@ -542,7 +584,7 @@ out:
 	result->iint = iint;
 	result->fn = function;
 	result->xattr = xattr_value;
-	result->xattr_len = xattr_len;
+	result->xattr_len = (size_t)xattr_len;
 
 	if (!iint || five_get_cache_status(iint) == FIVE_FILE_UNKNOWN
 			|| five_get_cache_status(iint) == FIVE_FILE_FAIL)
@@ -787,7 +829,7 @@ static struct notifier_block five_reboot_nb = {
 	.priority = INT_MAX,
 };
 
-int five_hash_algo = HASH_ALGO_SHA1;
+int five_hash_algo __ro_after_init = HASH_ALGO_SHA1;
 
 static int __init hash_setup(const char *str)
 {
@@ -842,6 +884,8 @@ static int __init init_five(void)
 	error = init_fs();
 	if (error)
 		return error;
+
+	five_dsms_init("1", 0);
 
 	error = five_init_dmverity();
 
