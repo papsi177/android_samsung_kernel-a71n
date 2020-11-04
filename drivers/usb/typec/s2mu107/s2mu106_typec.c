@@ -1500,6 +1500,17 @@ static bool s2mu106_poll_status(void *_data)
 			msg_id = header.msg_id;
 			pr_info("%s, prev msg_id =(%d), received msg_id =(%d)\n", __func__,
 										data->msg_id, msg_id);
+																				
+			if (header.num_data_objs > 0 && header.msg_type == USBPD_Alert) {
+				if (data->alert_msg_id == msg_id) {
+					pr_info("%s, alert ignored by same msg_id(%d)\n", __func__, msg_id);
+					goto out;
+				}
+				else
+					data->alert_msg_id = msg_id;
+			} else {
+				data->alert_msg_id = USBPD_nMessageIDCount + 1;
+			}
 #if 0
 			if (msg_id == data->msg_id)
 				goto out;

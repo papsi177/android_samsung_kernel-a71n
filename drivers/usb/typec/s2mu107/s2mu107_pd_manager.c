@@ -1413,7 +1413,12 @@ int usbpd_manager_evaluate_capability(struct usbpd_data *pd_data)
 #ifdef CONFIG_BATTERY_SAMSUNG
 #ifdef CONFIG_USB_TYPEC_MANAGER_NOTIFIER
 	if (manager->flash_mode == 1)
+	{
 		available_pdo_num = 1;
+#if defined(CONFIG_PDIC_PD30)
+		pdic_sink_status->has_apdo = false;
+#endif
+	}
 	pdic_sink_status->available_pdo_num = available_pdo_num;
 	return available_pdo_num;
 #endif

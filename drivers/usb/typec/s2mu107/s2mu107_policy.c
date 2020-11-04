@@ -5027,7 +5027,7 @@ policy_state usbpd_policy_snk_get_source_status(struct policy_data *policy)
 #if defined(CONFIG_PDIC_PD30)
 	struct usbpd_data *pd_data = policy_to_usbpd(policy);
 	int data_role = 0;
-
+	long long ms = 0;
 	/**********************************************
 	Actions on entry:
 	Send Get_Status MessageInitialize and run SenderResponseTimer
@@ -5050,6 +5050,24 @@ policy_state usbpd_policy_snk_get_source_status(struct policy_data *policy)
 	Actions on exit:
 	Pass Source status/outcome to Device Policy Manager
 	**********************************************/
+	/* Wait Message or State */
+	while (1) {
+		if (policy->plug_valid == 0) {
+			ret = PE_SNK_Get_Source_Status;
+			break;
+		}
+		ms = usbpd_check_time1(pd_data);
+		if (pd_data->phy_ops.get_status(pd_data, MSG_STATUS)) {
+			ret = PE_SNK_Ready;
+			break;
+		}
+
+		/* TimeOver Check */
+		if (ms >= tSenderResponse) {
+			ret = PE_SNK_Ready;
+			break;
+		}
+	}
 #endif
 	return ret;
 }

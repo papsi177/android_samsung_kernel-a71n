@@ -125,6 +125,7 @@ void usbpd_init_protocol(struct usbpd_data *pd_data)
 	rx_layer_init(&pd_data->protocol_rx);
 	tx_layer_init(&pd_data->protocol_tx);
 	pd_data->msg_id = USBPD_nMessageIDCount + 1;
+	pd_data->alert_msg_id = USBPD_nMessageIDCount + 1;
 }
 
 void usbpd_init_counters(struct usbpd_data *pd_data)
