@@ -47,7 +47,6 @@
 #include <linux/usb/typec/usb_typec_manager_notifier.h>
 #endif
 
-//#define FEATURE_I2C_CHANGE
 
 #ifdef CONFIG_OF
 #include <linux/of_gpio.h>
@@ -105,10 +104,11 @@ struct a96t3x6_data {
 	bool enabled;
 	bool skip_event;
 	bool resume_called;
+	bool crc_check;
 
 	int ldo_en;			/* ldo_en pin gpio */
 	int grip_int;			/* irq pin gpio */
-	const char *dvdd_vreg_name;		/* regulator name */
+	const char *dvdd_vreg_name;	/* regulator name */
 	struct regulator *dvdd_vreg;	/* regulator */
 	int (*power)(void *, bool on);	/* power onoff function ptr */
 	const char *chipid;
@@ -134,7 +134,7 @@ struct a96t3x6_data {
 static void a96t3x6_reset(struct a96t3x6_data *data);
 static void a96t3x6_check_first_status(struct a96t3x6_data *data, int enable);
 static void grip_always_active(struct a96t3x6_data *data, int on);
-#ifdef CONFIG_SENSORS_FW_VENDOR		
+#ifdef CONFIG_SENSORS_FW_VENDOR
 static int a96t3x6_fw_check(struct a96t3x6_data *data);
 static void a96t3x6_set_firmware_work(struct a96t3x6_data *data, u8 enable,
 		unsigned int time_ms);
@@ -868,10 +868,54 @@ static ssize_t grip_raw_show(struct device *dev,
 				data->grip_raw_d);
 }
 
-static ssize_t grip_gain_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
+static ssize_t grip_ref_cap_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d,%d,%d,%d\n", 0, 0, 0, 0);
+	struct a96t3x6_data *data = dev_get_drvdata(dev);
+	u8 r_buf[2];
+	int ref_cap;
+	int ret;
+
+	ret = a96t3x6_i2c_read(data->client, REG_REF_CAP, r_buf, 2);
+	if (ret < 0) {
+		SENSOR_ERR("fail(%d)\n", ret);
+		return snprintf(buf, PAGE_SIZE, "%d\n", 0);
+	}
+
+	ref_cap = (r_buf[0] << 8) | r_buf[1];
+	do_div(ref_cap, 100);
+
+	SENSOR_INFO("sub Ref Cap : %x,%x\n", r_buf[0], r_buf[1]);
+	SENSOR_INFO("sub Ref Cap / 100 : %d\n", ref_cap);
+
+	return sprintf(buf, "%d\n", ref_cap);
+}
+
+static ssize_t grip_gain_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct a96t3x6_data *data = dev_get_drvdata(dev);
+	u8 r_buf1[3], r_buf2[3];
+	int ret;
+
+	ret = a96t3x6_i2c_read(data->client, REG_GAINDATA, r_buf1, 3);
+	if (ret < 0) {
+		SENSOR_ERR("fail(%d)\n", ret);
+		return snprintf(buf, PAGE_SIZE, "%d\n", 0);
+	}
+
+	SENSOR_INFO("sub Gain : %d,%d,%d\n", (int)r_buf1[0], (int)r_buf1[1], (int)r_buf1[2]);
+
+	ret = a96t3x6_i2c_read(data->client, REG_REF_GAINDATA, r_buf2, 3);
+	if (ret < 0) {
+		SENSOR_ERR("fail(%d)\n", ret);
+		return snprintf(buf, PAGE_SIZE, "%d\n", 0);
+	}
+
+	SENSOR_INFO("sub Ref Gain : %d,%d,%d\n", (int)r_buf2[0], (int)r_buf2[1], (int)r_buf2[2]);
+
+	return sprintf(buf, "%d,%d,%d,%d,%d,%d\n", (int)r_buf1[0], (int)r_buf1[1], (int)r_buf1[2],
+	                                           (int)r_buf2[0], (int)r_buf2[1], (int)r_buf2[2]);
 }
 
 static ssize_t grip_check_show(struct device *dev,
@@ -1372,6 +1416,55 @@ static int a96t3x6_i2c_read_checksum(struct a96t3x6_data *data)
 	return 0;
 }
 
+#ifdef CONFIG_SENSORS_A96T3X6_CRC_CHECK
+static int a96t3x6_crc_check(struct a96t3x6_data *data)
+{
+	unsigned char cmd = 0xAA;
+	unsigned char val = 0xFF;
+	unsigned char retry = 2;
+	int ret;
+
+	/*
+	* abov grip fw uses active/deactive mode in each period
+	* To check crc check, make the mode as always active mode.
+	*/
+
+	grip_always_active(data, 1);
+
+	/* crc check */
+	ret = a96t3x6_i2c_write(data->client, REG_FW_VER, &cmd);
+	if (ret < 0) {
+		GRIP_INFO("crc checking enter failed\n");
+		grip_always_active(data, 0);
+		return ret;
+	}
+	// Note: The final decision of 'write result' is done in 'a96t3x6_flash_fw()'.
+	data->crc_check = CRC_FAIL;
+
+	while (retry--) {
+		msleep(400);
+
+		ret = a96t3x6_i2c_read(data->client, REG_FW_VER, &val, 1);
+		if (ret < 0) {
+			GRIP_INFO("crc read failed\n");
+			continue;
+		}
+
+		ret = (int)val;
+		if (val == 0x00) {
+			GRIP_INFO("crc check fail 0x%2x\n", val);
+		} else {
+			data->crc_check = CRC_PASS;
+			GRIP_INFO("crc check normal 0x%2x\n", val);
+			break;
+		}
+	}
+
+	grip_always_active(data, 0);
+	return ret;
+}
+#endif
+
 static int a96t3x6_fw_write(struct a96t3x6_data *data, unsigned char *addrH,
 						unsigned char *addrL, unsigned char *val)
 {
@@ -1786,9 +1879,10 @@ static ssize_t grip_reg_store(struct device *dev,
 }
 
 static ssize_t grip_crc_check_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
+	struct device_attribute *attr, char *buf)
 {
 	struct a96t3x6_data *data = dev_get_drvdata(dev);
+#ifndef CONFIG_SENSORS_A96T3X6_CRC_CHECK
 	int ret;
 
 	unsigned char cmd[3] = {0x1B, 0x00, 0x10};
@@ -1804,11 +1898,11 @@ static ssize_t grip_crc_check_show(struct device *dev,
 	grip_always_active(data, 0);
 
 	if (ret < 0) {
-		SENSOR_ERR("sub i2c read fail\n");
+		GRIP_ERR("i2c read fail\n");
 		return snprintf(buf, PAGE_SIZE, "NG,0000\n");
 	}
 
-	SENSOR_INFO("sub CRC:%02x%02x, BIN:%02x%02x\n", checksum[0], checksum[1],
+	GRIP_INFO("CRC:%02x%02x, BIN:%02x%02x\n", checksum[0], checksum[1],
 		data->checksum_h_bin, data->checksum_l_bin);
 
 	if ((checksum[0] != data->checksum_h_bin) ||
@@ -1818,6 +1912,17 @@ static ssize_t grip_crc_check_show(struct device *dev,
 	else
 		return snprintf(buf, PAGE_SIZE, "OK,%02x%02x\n",
 			checksum[0], checksum[1]);
+#else
+{
+	int val;
+	val = a96t3x6_crc_check(data);
+
+	if (data->crc_check == CRC_PASS)
+		return snprintf(buf, PAGE_SIZE, "OK,%02x\n", val);
+	else
+		return snprintf(buf, PAGE_SIZE, "NG,%02x\n", val);
+}
+#endif
 }
 
 static ssize_t a96t3x6_enable_show(struct device *dev,
@@ -1838,6 +1943,7 @@ static DEVICE_ATTR(grip_earjack, 0220, NULL, grip_sensing_change);
 static DEVICE_ATTR(grip, 0444, grip_show, NULL);
 static DEVICE_ATTR(grip_baseline, 0444, grip_baseline_show, NULL);
 static DEVICE_ATTR(grip_raw, 0444, grip_raw_show, NULL);
+static DEVICE_ATTR(grip_ref_cap, 0444, grip_ref_cap_show, NULL);
 static DEVICE_ATTR(grip_gain, 0444, grip_gain_show, NULL);
 static DEVICE_ATTR(grip_check, 0444, grip_check_show, NULL);
 #ifndef CONFIG_SAMSUNG_PRODUCT_SHIP
@@ -1872,6 +1978,7 @@ static struct device_attribute *grip_sensor_attributes[] = {
 	&dev_attr_grip,
 	&dev_attr_grip_baseline,
 	&dev_attr_grip_raw,
+	&dev_attr_grip_ref_cap,
 	&dev_attr_grip_gain,
 	&dev_attr_grip_check,
 #ifndef CONFIG_SAMSUNG_PRODUCT_SHIP
@@ -1932,9 +2039,9 @@ static int a96t3x6_fw_check(struct a96t3x6_data *data)
 		force = true;
 	}
 
-	if (data->fw_ver < data->fw_ver_bin || data->fw_ver > 0xa0
-				|| force == true) {
-		SENSOR_ERR("sub excute fw update (0x%x -> 0x%x)\n",
+	if (data->fw_ver < data->fw_ver_bin || data->fw_ver > TEST_FIRMWARE_DETECT_VER
+				|| force == true || data->crc_check == CRC_FAIL) {
+		SENSOR_ERR("excute fw update (0x%x -> 0x%x)\n",
 			data->fw_ver, data->fw_ver_bin);
 		ret = a96t3x6_flash_fw(data, true, BUILT_IN);
 		if (ret)
@@ -2244,6 +2351,7 @@ static int a96t3x6_probe(struct i2c_client *client,
 	data->expect_state = false;
 	data->skip_event = false;
 	data->sar_mode = false;
+	data->crc_check = CRC_PASS;
 	wake_lock_init(&data->grip_wake_lock, WAKE_LOCK_SUSPEND, "grip_sub wake lock");
 
 	ret = a96t3x6_parse_dt(data, &client->dev);
@@ -2269,11 +2377,29 @@ static int a96t3x6_probe(struct i2c_client *client,
 
 	i2c_set_clientdata(client, data);
 #ifndef CONFIG_SENSORS_FW_VENDOR
+#if defined(CONFIG_SEC_FACTORY) && defined(CONFIG_SENSORS_A96T3X6_CRC_CHECK)
+	a96t3x6_crc_check(data);
+#endif
 	ret = a96t3x6_fw_check(data);
 	if (ret) {
-		SENSOR_ERR("sub failed to firmware check (%d)\n", ret);
+		GRIP_ERR("failed to firmware check (%d)\n", ret);
 		goto err_reg_input_dev;
 	}
+#else
+{
+	/*
+	 * Add probe fail routine if i2c is failed
+	 * non fw IC returns 0 from ALL register but i2c is success.
+	 */
+	u8 buf;
+	ret = a96t3x6_i2c_read(client, REG_MODEL_NO, &buf, 1);
+	if (ret) {
+		GRIP_ERR("i2c is failed %d\n", ret);
+		goto err_reg_input_dev;
+	} else {
+		GRIP_INFO("i2c is normal, model_no = 0x%2x\n", buf);
+	}
+}
 #endif
 	input_dev->name = MODULE_NAME;
 	input_dev->id.bustype = BUS_I2C;

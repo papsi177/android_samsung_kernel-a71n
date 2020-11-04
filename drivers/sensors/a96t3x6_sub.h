@@ -63,6 +63,10 @@
 #define REG_GRIP_ALWAYS_ACTIVE		0x20
 #define GRIP_ALWAYS_ACTIVE_READY	0x21
 
+#define REG_REF_CAP		0x50
+#define REG_GAINDATA		0x52
+#define REG_REF_GAINDATA	0x58
+
 /* command */
 #define CMD_ON			0x20
 #define CMD_OFF			0x10
@@ -72,6 +76,10 @@
 #define RESET_DELAY		150000
 #define FLASH_DELAY		1400000
 #define FLASH_MODE		0x18
+
+#define CRC_FAIL                0
+#define CRC_PASS                1
+#define TEST_FIRMWARE_DETECT_VER 0xa0
 
 #define TK_FW_PATH_BIN 		"abov/abov_noble.fw"
 #define TK_FW_PATH_SDCARD	"/sdcard/Firmware/Gripsub/abov_fw.bin"
@@ -86,5 +94,9 @@ enum {
 	BUILT_IN = 0,
 	SDCARD,
 };
+
+#define GRIP_ERR(fmt, ...) pr_err("[GRIP_SUB] %s: "fmt, __func__, ##__VA_ARGS__)
+#define GRIP_INFO(fmt, ...) pr_info("[GRIP_SUB] %s: "fmt, __func__, ##__VA_ARGS__)
+#define GRIP_WARN(fmt, ...) pr_warn("[GRIP_SUB] %s: "fmt, __func__, ##__VA_ARGS__)
 
 #endif /* LINUX_A96T3X6_H */
