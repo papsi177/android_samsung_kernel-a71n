@@ -22,6 +22,7 @@
 #include <linux/extcon.h>
 #include <linux/usb/class-dual-role.h>
 #include "storm-watch.h"
+#include "battery.h"
 
 enum print_reason {
 	PR_INTERRUPT	= BIT(0),
@@ -447,7 +448,6 @@ struct smb_charger {
 	int			*pd_disabled;
 	enum smb_mode		mode;
 	struct smb_chg_freq	chg_freq;
-	int			smb_version;
 	int			otg_delay_ms;
 	int			*weak_chg_icl_ua;
 	bool			pd_not_supported;
@@ -459,6 +459,10 @@ struct smb_charger {
 	struct mutex		ps_change_lock;
 	struct mutex		dr_lock;
 	struct mutex		irq_status_lock;
+#if defined(CONFIG_BATTERY_SAMSUNG_USING_QC)
+	struct mutex		rechg_volt_lock;
+#endif
+	spinlock_t		typec_pr_lock;
 
 	/* power supplies */
 	struct power_supply		*batt_psy;
@@ -529,6 +533,7 @@ struct smb_charger {
 	struct delayed_work	usbov_dbc_work;
 	struct delayed_work	role_reversal_check;
 	struct delayed_work	pr_swap_detach_work;
+	struct delayed_work	pr_lock_clear_work;
 	struct delayed_work	detach_work;
 #if defined(CONFIG_BATTERY_SAMSUNG_USING_QC)
 	struct delayed_work    compliant_check_work;
@@ -547,7 +552,10 @@ struct smb_charger {
 	int 				hiccup_gpio;
 	struct device		*hiccup_dev;
 #endif //CONFIG_PM6150_WATER_DETECT	
-
+#if defined(CONFIG_PM6150_USB_FALSE_DETECTION_WA_BY_GND) && !defined(CONFIG_SEC_FACTORY)
+	int 				rid_gnd_gpio_sts;
+#endif
+    struct charger_param	chg_param;
 	/* secondary charger config */
 	bool			sec_pl_present;
 	bool			sec_cp_present;
@@ -559,10 +567,12 @@ struct smb_charger {
 	int			voltage_max_uv;
 	int			pd_active;
 	bool			pd_hard_reset;
+	bool			pr_lock_in_progress;
 	bool			pr_swap_in_progress;
 	bool			early_usb_attach;
 	bool			ok_to_pd;
 	bool			typec_legacy;
+	bool			typec_irq_en;
 
 	/* cached status */
 	bool			system_suspend_supported;
@@ -616,6 +626,7 @@ struct smb_charger {
 	int			last_capacity;
 #endif
 	enum sink_src_mode	sink_src_mode;
+	enum power_supply_typec_power_role power_role;
 	enum jeita_cfg_stat	jeita_configured;
 	int			charger_temp_max;
 	int			smb_temp_max;
@@ -658,6 +669,7 @@ struct smb_charger {
 	int			usbin_forced_max_uv;
 	int			init_thermal_ua;
 	u32			comp_clamp_level;
+	bool			hvdcp3_standalone_config;
 	bool			wdog_snarl_based_step_chg;
 
 	/* workaround flag */
@@ -932,6 +944,7 @@ void smblib_apsd_enable(struct smb_charger *chg, bool enable);
 int smblib_force_vbus_voltage(struct smb_charger *chg, u8 val);
 int smblib_get_irq_status(struct smb_charger *chg,
 				union power_supply_propval *val);
+int smblib_get_qc3_main_icl_offset(struct smb_charger *chg, int *offset_ua);
 
 int smblib_init(struct smb_charger *chg);
 int smblib_deinit(struct smb_charger *chg);
@@ -947,5 +960,10 @@ int smblib_get_prop_input_current_register(struct smb_charger *chg,
 #if defined(CONFIG_AFC)
 int is_afc_result(struct smb_charger *chg,int result);
 #endif
+#endif
+#if defined(CONFIG_PM6150_USB_FALSE_DETECTION_WA_BY_GND) && !defined(CONFIG_SEC_FACTORY)
+void smb5_rid_pm6150l_init(struct smb_charger *chg);
+void smblib_drp_enable(struct smb_charger *chg);
+void smblib_drp_disable(struct smb_charger *chg);
 #endif
 #endif /* __SMB5_CHARGER_H */

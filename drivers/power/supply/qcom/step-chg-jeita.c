@@ -492,6 +492,7 @@ static int get_val(struct range_data *range, int hysteresis, int current_index,
 		int *new_index, int *val)
 {
 #if defined(CONFIG_BATTERY_SAMSUNG_USING_QC)
+	struct sec_battery_info *battery = get_sec_battery();
 	union power_supply_propval pval = {0, };
 	int rc = 0;
 	int rechg_vbat_cool;
@@ -642,6 +643,11 @@ static int get_val(struct range_data *range, int hysteresis, int current_index,
 				POWER_SUPPLY_PROP_RECHARGE_VBAT, &pval);
 		if (rc < 0)
 			pr_err("Set recharge Vbat failed, rc=%d\n", rc);
+		if (!battery) {
+			pr_info("%s: return index = %d -> %d\n",
+				__func__, *new_index, current_index);
+			*new_index = current_index;
+		}
 	}
 #endif
 	return 0;
