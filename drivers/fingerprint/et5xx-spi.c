@@ -58,33 +58,6 @@ static void fill_bus_vector(void)
 }
 #endif
 
-
-void etspi_pin_control(struct etspi_data *etsspi, bool pin_set)
-{
-	int status = 0;
-
-	etsspi->p->state = NULL;
-	if (pin_set) {
-		if (!IS_ERR(etsspi->pins_idle)) {
-			status = pinctrl_select_state(etsspi->p,
-				etsspi->pins_idle);
-			if (status)
-				pr_err("%s: can't set pin default state\n",
-					__func__);
-			pr_debug("%s idle\n", __func__);
-		}
-	} else {
-		if (!IS_ERR(etsspi->pins_sleep)) {
-			status = pinctrl_select_state(etsspi->p,
-				etsspi->pins_sleep);
-			if (status)
-				pr_err("%s: can't set pin sleep state\n",
-					__func__);
-			pr_debug("%s sleep\n", __func__);
-		}
-	}
-}
-
 static irqreturn_t etspi_fingerprint_interrupt(int irq, void *dev_id)
 {
 	struct etspi_data *etspi = (struct etspi_data *)dev_id;
@@ -198,23 +171,98 @@ static void etspi_reset(struct etspi_data *etspi)
 	etspi->reset_count++;
 }
 
+void etspi_pin_control(struct etspi_data *etsspi, bool pin_set)
+{
+	int status = 0;
+
+	etsspi->p->state = NULL;
+	if (pin_set) {
+		if (!IS_ERR(etsspi->pins_idle)) {
+			status = pinctrl_select_state(etsspi->p,
+				etsspi->pins_idle);
+			if (status)
+				pr_err("%s: can't set pin default state\n",
+					__func__);
+			pr_debug("%s idle\n", __func__);
+		}
+	} else {
+		if (!IS_ERR(etsspi->pins_sleep)) {
+			status = pinctrl_select_state(etsspi->p,
+				etsspi->pins_sleep);
+			if (status)
+				pr_err("%s: can't set pin sleep state\n",
+					__func__);
+			pr_debug("%s sleep\n", __func__);
+		}
+	}
+}
+
+static void etspi_power_set(struct etspi_data *etspi, int status)
+{
+	int rc = 0;
+	if (etspi->ldo_pin) {
+		pr_info("%s, ldo\n", __func__);
+		if (status == 1) {
+			if (etspi->ldo_pin) {
+				gpio_set_value(etspi->ldo_pin, 1);
+				etspi->ldo_enabled = 1;
+			}
+		} else if (status == 0) {
+			if (etspi->ldo_pin) {
+				gpio_set_value(etspi->ldo_pin, 0);
+				etspi->ldo_enabled = 0;
+			}
+		} else {
+			pr_err("%s can't support this value. %d\n",
+				__func__, status);
+		}
+	} else if (etspi->regulator_3p3 != NULL) {
+		pr_info("%s, regulator, status %d\n", __func__, status);
+		if (status == 1) {
+			if (regulator_is_enabled(etspi->regulator_3p3) == 0) {
+				rc = regulator_enable(etspi->regulator_3p3);
+				if (rc)
+					pr_err("%s regulator enable failed, rc=%d\n",
+						__func__, rc);
+				else
+					etspi->ldo_enabled = 1;
+			} else
+				pr_info("%s, regulator is already enabled\n", __func__);
+		} else if (status == 0) {
+			if (regulator_is_enabled(etspi->regulator_3p3)) {
+				rc = regulator_disable(etspi->regulator_3p3);
+				if (rc)
+					pr_err("%s regulator disable failed, rc=%d\n",
+						__func__, rc);
+				else
+					etspi->ldo_enabled = 0;
+			} else
+				pr_info("%s, regulator is already disabled\n", __func__);
+		} else {
+			pr_err("%s can't support this value. %d\n",
+				__func__, status);
+		}
+	} else {
+		pr_info("%s This HW revision does not support a power control\n",
+			__func__);
+	}
+}
+
 static void etspi_power_control(struct etspi_data *etspi, int status)
 {
 	pr_info("%s status = %d\n", __func__, status);
 	if (status == 1) {
-		if (etspi->ldo_pin)
-			gpio_set_value(etspi->ldo_pin, 1);
-		usleep_range(1100, 1150);
+		etspi_power_set(etspi, 1);
+		etspi_pin_control(etspi, 1);
+		usleep_range(1600, 1650);
 		if (etspi->sleepPin)
 			gpio_set_value(etspi->sleepPin, 1);
-		etspi_pin_control(etspi, true);
-		usleep_range(10000, 10050);
+		usleep_range(12000, 12050);
 	} else if (status == 0) {
-		etspi_pin_control(etspi, false);
 		if (etspi->sleepPin)
 			gpio_set_value(etspi->sleepPin, 0);
-		if (etspi->ldo_pin)
-			gpio_set_value(etspi->ldo_pin, 0);
+		etspi_power_set(etspi, 0);
+		etspi_pin_control(etspi, 0);
 	} else {
 		pr_err("%s can't support this value. %d\n", __func__, status);
 	}
@@ -784,6 +832,9 @@ int etspi_platformInit(struct etspi_data *etspi)
 				goto etspi_platformInit_ldo_failed;
 			}
 			gpio_direction_output(etspi->ldo_pin, 0);
+			etspi->ldo_enabled = 0;
+			pr_info("%s ldo en value =%d\n",
+				__func__, gpio_get_value(etspi->ldo_pin));
 		}
 		status = gpio_request(etspi->sleepPin, "etspi_sleep");
 		if (status < 0) {
@@ -799,6 +850,8 @@ int etspi_platformInit(struct etspi_data *etspi)
 			status = -EBUSY;
 			goto etspi_platformInit_sleep_failed;
 		}
+		pr_info("%s sleep value =%d\n",
+				__func__, gpio_get_value(etspi->sleepPin));
 
 		status = gpio_request(etspi->drdyPin, "etspi_drdy");
 		if (status < 0) {
@@ -813,15 +866,9 @@ int etspi_platformInit(struct etspi_data *etspi)
 				__func__);
 			goto etspi_platformInit_gpio_init_failed;
 		}
-
-		pr_info("%s sleep value =%d\n"
-				"%s ldo en value =%d\n",
-				__func__, gpio_get_value(etspi->sleepPin),
-				__func__, gpio_get_value(etspi->ldo_pin));
 	} else {
 		status = -EFAULT;
 	}
-
 
 #ifdef ENABLE_SENSORS_FPRINT_SECURE
 	wake_lock_init(&etspi->fp_spi_lock,
@@ -905,6 +952,20 @@ static int etspi_parse_dt(struct device *dev,
 	if (of_property_read_u32(np, "etspi-min_cpufreq_limit",
 		&data->min_cpufreq_limit))
 		data->min_cpufreq_limit = 0;
+
+	if (of_property_read_string(np, "etspi-regulator", &data->btp_vdd) < 0) {
+		pr_info("not use btp_regulator\n");
+		data->btp_vdd = NULL;
+	} else {
+		data->regulator_3p3 = regulator_get(NULL, data->btp_vdd);
+		if (IS_ERR(data->regulator_3p3) ||
+				(data->regulator_3p3) == NULL) {
+			pr_info("not use regulator_3p3\n");
+			data->regulator_3p3 = NULL;
+		} else {
+			pr_info("btp_regulator ok\n");
+		}
+	}
 
 	if (of_property_read_string_index(np, "etspi-chipid", 0,
 			(const char **)&data->chipid)) {
@@ -1140,7 +1201,6 @@ static DEVICE_ATTR(adm, 0444, etspi_adm_show, NULL);
 static DEVICE_ATTR(intcnt, 0664, etspi_intcnt_show, etspi_intcnt_store);
 static DEVICE_ATTR(resetcnt, 0664, etspi_resetcnt_show, etspi_resetcnt_store);
 
-
 static struct device_attribute *fp_attrs[] = {
 	&dev_attr_bfs_values,
 	&dev_attr_type_check,
@@ -1154,14 +1214,9 @@ static struct device_attribute *fp_attrs[] = {
 
 static void etspi_work_func_debug(struct work_struct *work)
 {
-	u8 ldo_value = 0;
-
-	if (g_data->ldo_pin)
-		ldo_value = gpio_get_value(g_data->ldo_pin);
-
 	pr_info("%s ldo: %d, sleep: %d, tz: %d, spi_value: 0x%x, type: %s\n",
 		__func__,
-		ldo_value, gpio_get_value(g_data->sleepPin),
+		g_data->ldo_enabled, gpio_get_value(g_data->sleepPin),
 		g_data->tz_mode, g_data->spi_value,
 		sensor_status[g_data->sensortype + 2]);
 }

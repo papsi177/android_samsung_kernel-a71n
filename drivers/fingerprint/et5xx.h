@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/spi/spi.h>
 #include <linux/wakelock.h>
+#include <linux/regulator/consumer.h>
 #ifdef ENABLE_SENSORS_FPRINT_SECURE
 #include <linux/clk.h>
 #include <linux/pm_runtime.h>
@@ -228,6 +229,8 @@ struct etspi_data {
 	unsigned int sleepPin;	/* Sleep GPIO pin number */
 	unsigned int ldo_pin;	/* Ldo GPIO pin number */
 	unsigned int min_cpufreq_limit;
+	const char *btp_vdd;
+	struct regulator *regulator_3p3;
 	unsigned int spi_cs;	/* spi cs pin <temporary gpio setting> */
 
 	unsigned int drdy_irq_flag;	/* irq flag */
@@ -255,6 +258,7 @@ struct etspi_data {
 	int detect_threshold;
 	bool finger_on;
 	const char *chipid;
+	bool ldo_enabled;
 	unsigned int orient;
 	struct pinctrl *p;
 	struct pinctrl_state *pins_sleep;
