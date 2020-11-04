@@ -802,7 +802,7 @@ ssize_t sec_bat_show_attrs(struct device *dev,
 			psy_do_property(battery->pdata->fgsrc_switch_name, set,
 					POWER_SUPPLY_EXT_PROP_INBAT_VOLTAGE_FGSRC_SWITCHING, value);
 			for (j = 0; j < 10; j++) {
-				mdelay(175);
+				msleep(175);
 				psy_do_property(battery->pdata->fuelgauge_name, get,
 						POWER_SUPPLY_PROP_VOLTAGE_NOW, value);
 				ocv_data[j] = value.intval;
@@ -2824,7 +2824,7 @@ ssize_t sec_bat_store_attrs(
 		if (sscanf(buf, "%10d\n", &x) == 1) {
 			pr_info("%s: Charger WDT Set : %d\n", __func__, x);
 			battery->wdt_kick_disable = x;
-#if defined(CONFIG_ENG_BATTERY_CONCEPT) && defined(CONFIG_DIRECT_CHARGING)
+#if defined(CONFIG_DIRECT_CHARGING)
 			value.intval = x;
 			psy_do_property(battery->pdata->charger_name, set,
 				POWER_SUPPLY_EXT_PROP_DIRECT_WDT_CONTROL, value);

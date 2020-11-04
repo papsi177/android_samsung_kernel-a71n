@@ -138,7 +138,7 @@ static void sm5713_fg_periodic_read(struct sm5713_fuelgauge_data *fuelgauge)
 			data[0x08], data[0x09], data[0x0a], data[0x0b],
 			data[0x0c], data[0x0d], data[0x0e], data[0x0f]);
 		if (!fuelgauge->initial_update_of_soc) {
-			mdelay(1); /* it has to call mdelay */
+			usleep_range(1000, 2000);
 		}
 	}
 

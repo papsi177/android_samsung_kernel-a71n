@@ -112,17 +112,12 @@ static bool sec_direct_chg_set_switching_charge(
 		sec_direct_charger_mode_str[charger->charger_mode_main],
 		sec_direct_charger_mode_str[charger_mode]);
 
-	if ((charger->charger_mode_main != charger_mode)
-#if defined(CONFIG_LSI_IFPMIC)
-		|| (charger_mode == SEC_BAT_CHG_MODE_BUCK_OFF)
-#endif
-		) {
-		charger->charger_mode_main = charger_mode;
 
-		value.intval = charger_mode;
-		psy_do_property(charger->pdata->main_charger_name, set,
-			POWER_SUPPLY_PROP_CHARGING_ENABLED, value);
-	}
+	charger->charger_mode_main = charger_mode;
+
+	value.intval = charger_mode;
+	psy_do_property(charger->pdata->main_charger_name, set,
+		POWER_SUPPLY_PROP_CHARGING_ENABLED, value);
 
 
 	return true;
@@ -187,7 +182,10 @@ static int sec_direct_chg_check_charging_source(struct sec_direct_charger_info *
 		(charger->batt_status == POWER_SUPPLY_STATUS_DISCHARGING))
 		return SEC_DIRECT_CHG_CHARGING_SOURCE_SWITCHING;
 
-	if (charger->direct_chg_done || (charger->capacity >= 95))
+	psy_do_property("battery", get,
+				POWER_SUPPLY_EXT_PROP_DIRECT_HAS_APDO, value);
+
+	if (charger->direct_chg_done || (charger->capacity >= 95) || !value.intval)
 		return SEC_DIRECT_CHG_CHARGING_SOURCE_SWITCHING;
 
 	return SEC_DIRECT_CHG_CHARGING_SOURCE_DIRECT;
@@ -196,6 +194,7 @@ static int sec_direct_chg_check_charging_source(struct sec_direct_charger_info *
 static int sec_direct_chg_set_charging_source(struct sec_direct_charger_info *charger,
 		unsigned int charger_mode, int charging_source)
 {
+	mutex_lock(&charger->charger_mutex);
 	if (charging_source == SEC_DIRECT_CHG_CHARGING_SOURCE_DIRECT &&
 		charger_mode == SEC_BAT_CHG_MODE_CHARGING) {
 		sec_direct_chg_set_switching_charge(charger, SEC_BAT_CHG_MODE_BUCK_OFF);
@@ -242,6 +241,7 @@ static int sec_direct_chg_set_charging_source(struct sec_direct_charger_info *ch
 	}
 
 	charger->charging_source = charging_source;
+	mutex_unlock(&charger->charger_mutex);
 
 	return 0;
 }
@@ -571,6 +571,11 @@ static int sec_direct_chg_set_property(struct power_supply *psy,
                 sec_direct_chg_set_charging_source(charger, SEC_BAT_CHG_MODE_CHARGING, charger->test_mode_source);
             }
             break;
+		case POWER_SUPPLY_EXT_PROP_DIRECT_CLEAR_ERR:
+			/* If SRCCAP is changed by Src, clear DC err variables */
+			charger->dc_err = false;
+			charger->dc_retry_cnt = 0;
+			break;
  		default:
 			ret = psy_do_property(charger->pdata->main_charger_name, set, ext_psp, value);
 			return ret;

@@ -313,10 +313,10 @@ static int s2mu106_charger_otg_control(
 		msleep(30);
 		/* 5. QBAT On even if BAT OCP occure */
 		s2mu106_update_reg(charger->i2c, S2MU106_CHG_CTRL9, 0x0, 0x10);
-		mdelay(10);
+		msleep(10);
 		/* 6. OTG Enable */
 		regmode_vote(charger, REG_MODE_OTG, REG_MODE_OTG);
-		mdelay(20);
+		msleep(20);
 
 		/* OTG Fault debounce time set 15ms */
 		s2mu106_update_reg(charger->i2c, 0x94, 0x0C, 0x0C);
@@ -377,10 +377,10 @@ static void s2mu106_set_buck(
 		pr_info("[DEBUG]%s: check input current(%d, %d)\n",
 			__func__, prev_current, charger->input_current);
 		s2mu106_set_input_current_limit(charger, 50);
-		mdelay(50);
+		msleep(50);
 		/* async mode */
 		s2mu106_update_reg(charger->i2c, 0x3A, 0x03, 0x03);
-		mdelay(50);
+		msleep(50);
 		regmode_vote(charger, REG_MODE_CHG|REG_MODE_BUCK, 0);
 		/* auto async mode */
 		s2mu106_update_reg(charger->i2c, 0x3A, 0x01, 0x03);
@@ -651,6 +651,16 @@ static bool s2mu106_chg_init(struct s2mu106_charger_data *charger)
 {
 	u8 temp;
 
+#if !defined(CONFIG_SEC_A71_PROJECT)
+	if (!factory_mode) {
+		/* HW Factory OFF (at Normal booting) */
+		s2mu106_update_reg(charger->i2c, 0xF3, 0x00, 0x02);
+		pr_info("%s this is not factory mode! write 0xF3[1] = 0\n", __func__);
+	}
+	s2mu106_read_reg(charger->i2c, 0xF3, &temp);
+	pr_info("%s : 0xF3 register : 0x%2x\n", __func__, temp);
+#endif
+
 	/* Set default regulation voltage 4.35v
 	s2mu106_update_reg(charger->i2c,
 			S2MU106_CHG_CTRL5, 0x5A << SET_VF_VBAT_SHIFT, SET_VF_VBAT_MASK);
@@ -672,6 +682,14 @@ static bool s2mu106_chg_init(struct s2mu106_charger_data *charger)
 
 	s2mu106_read_reg(charger->i2c, S2MU106_CHG_CTRL12, &temp);
 	pr_info("%s : for WDT setting S2MU106_CHG_CTRL12 : 0x%x\n", __func__, temp);
+
+#ifndef CONFIG_SEC_FACTORY
+	/* VSSH LDO enable, even if vbusdet vol drop */
+	/* Can not be charged after ovp test W/A */
+	s2mu106_update_reg(charger->i2c, 0x3C, 0x30, 0x30);
+#else
+	s2mu106_update_reg(charger->i2c, 0x3C, 0x10, 0x30);
+#endif
 
 	/* ICR Disable */
 	s2mu106_update_reg(charger->i2c, 0x7D, 0x02, 0x02);
@@ -701,8 +719,9 @@ static bool s2mu106_chg_init(struct s2mu106_charger_data *charger)
 				S2MU106_TOPOFF_TIMER_90m << TOP_OFF_TIME_SHIFT, TOP_OFF_TIME_MASK);
 
 	/* vbat ocp 5.5A */
-	s2mu106_update_reg(charger->i2c, S2MU106_CHG_CTRL21,
-				S2MU106_SET_BAT_OCP_5500mA << SET_BAT_OCP_SHIFT, SET_BAT_OCP_MASK);
+	s2mu106_update_reg(charger->i2c, S2MU106_CHG_CTRL9,
+				S2MU106_SET_BAT_OCP_5500mA, SET_BAT_OCP_MASK);
+
 	/* ivr debounce time(default 10ms -> 30ms) */
 	s2mu106_update_reg(charger->i2c, 0x95, 0x03, 0x03);
 	
@@ -1131,6 +1150,9 @@ static int s2mu106_chg_set_property(struct power_supply *psy,
 	union power_supply_propval value;
 	int ret;
 	u8 data = 0;
+#if !defined(CONFIG_SEC_A71_PROJECT)
+	u8 temp;
+#endif
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
@@ -1294,10 +1316,24 @@ static int s2mu106_chg_set_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_ENERGY_NOW:
 		if (val->intval) {
+#if !defined(CONFIG_SEC_A71_PROJECT)
+			/* forced set buck on /charge off in 523k case */
+			s2mu106_update_reg(charger->i2c, S2MU106_CHG_CTRL0, BUCK_MODE, REG_MODE_MASK);
+#endif
 			pr_info("%s: Set Factory Mode (vbus + 523K / 301K)\n", __func__);
+#if !defined(CONFIG_SEC_A71_PROJECT)
+			/* ICR 2A(*2A: TA Target, can be changed */
+			s2mu106_update_reg(charger->i2c, S2MU106_CHG_CTRL1, 0x4E, 0x7F);
+
+			s2mu106_read_reg(charger->i2c, 0xF3, &temp);
+			pr_info("%s : 0xF3 register : 0x%2x\n", __func__, temp);
+
+			/* 200msec delay */
+			msleep(200);
+#endif
 #if defined(CONFIG_LEDS_S2MU106_FLASH)
 			/* FLED driver TA only mode set, 0x5C[7:6] -> 0x02*/
-			//s2mu106_fled_set_operation_mode(1);
+			s2mu106_fled_set_operation_mode(1);
 #endif
 			/* SYS Output 4.2V Set*/
 			s2mu106_update_reg(charger->i2c, 0x20, 0x05, 0x07);
@@ -1307,30 +1343,45 @@ static int s2mu106_chg_set_property(struct power_supply *psy,
 
 			/* ICR Disable at Factory Mode  */
 			s2mu106_update_reg(charger->i2c, 0x7D, 0x02, 0x02);
-
-			/* QBAT OFF */	
+#if defined(CONFIG_SEC_A71_PROJECT)
+			/* QBAT OFF */
 			s2mu106_update_reg(charger->i2c, 0x2F, 0xC0, 0xC0);
 			s2mu106_update_reg(charger->i2c, 0x8B, 0x00, 0x08);
 			s2mu106_update_reg(charger->i2c, 0x38, 0x00, 0x03);
-			
+#endif
 			/* EN_MRST, MRSTBTMR2.0s (can be changed) */
 			s2mu106_update_reg(charger->i2c, 0xE5, 0x09, 0x0F);
 
 			/* RST_SW_CHG (CHG VIO Reset Off) */
 			s2mu106_update_reg(charger->i2c, 0xEF, 0x0, 0x1);
-
+#if !defined(CONFIG_SEC_A71_PROJECT)
+			/* QBAT OFF */
+			s2mu106_update_reg(charger->i2c, 0x2F, 0xC0, 0xC0);
+			s2mu106_update_reg(charger->i2c, 0x8B, 0x00, 0x08);
+			s2mu106_update_reg(charger->i2c, 0x38, 0x00, 0x03);
+#endif
 			charger->input_current = s2mu106_get_input_current_limit(charger);
 			s2mu106_update_reg(charger->i2c, S2MU106_CHG_CTRL1, 0x4E, 0x7F);
-
+#if !defined(CONFIG_SEC_A71_PROJECT)
+			/* HW Factory ON */
+			s2mu106_update_reg(charger->i2c, 0xF3, 0x02, 0x02);
+			s2mu106_read_reg(charger->i2c, 0xF3, &temp);
+			pr_info("%s : 0xF3 register : 0x%2x\n", __func__, temp);
+#endif
 			/* Switchingfor fuel gauge to get SYS voltage */
 			value.intval = SEC_BAT_FGSRC_SWITCHING_OFF;
 			psy_do_property("s2mu106-fuelgauge", set,
 				POWER_SUPPLY_EXT_PROP_INBAT_VOLTAGE_FGSRC_SWITCHING, value);
  		} else {
 			pr_info("%s: Release Factory Mode (vbus + 619K)\n", __func__);
+#if !defined(CONFIG_SEC_A71_PROJECT)
+			/* HW Factory OFF */
+			s2mu106_update_reg(charger->i2c, 0xF3, 0x00, 0x02);
+			pr_info("%s 0xF3[1] = 0\n", __func__);
+#endif
 #if defined(CONFIG_LEDS_S2MU106_FLASH)
 			/* FLED driver Auto control mode set, 0x5C[7:6] -> 0x00*/
-			//s2mu106_fled_set_operation_mode(0);
+			s2mu106_fled_set_operation_mode(0);
 #endif
 			/* QBATON */
 			s2mu106_update_reg(charger->i2c, 0x2F, 0x40, 0xC0);
@@ -1339,7 +1390,10 @@ static int s2mu106_chg_set_property(struct power_supply *psy,
 
 			/* EN_MRST, MRSTBTMR7.0s */
 			s2mu106_update_reg(charger->i2c, 0xE5, 0x0E, 0x0F);
-
+#if !defined(CONFIG_SEC_A71_PROJECT)
+			/* ICR Enable */
+			s2mu106_update_reg(charger->i2c, 0x7D, 0x00, 0x02);
+#endif
 			/* ICR2A(*2A: VBUS+619k condition, can be changed) */
 			s2mu106_update_reg(charger->i2c, S2MU106_CHG_CTRL1, 0x46, 0x7F);
 
@@ -1452,6 +1506,11 @@ static int s2mu106_chg_set_property(struct power_supply *psy,
 				 * Charger/muic interrupt can occur by entering Bypass mode
 				 * Disable all interrupt mask for testing current measure.
 				 */
+#ifndef CONFIG_SEC_FACTORY
+				/* VSSH LDO default setting */
+				/* Can not be charged after ovp test W/A */
+				s2mu106_update_reg(charger->i2c, 0x3C, 0x10, 0x30);
+#endif
 
 				/* PM Disable */
 				psy_do_property("s2mu106_pmeter", set,
@@ -1485,7 +1544,11 @@ static int s2mu106_chg_set_property(struct power_supply *psy,
 				s2mu106_update_reg(charger->i2c, 0xEF, 0x0, 0x1);
 			} else {
 				pr_info("%s: Bypass exit for current measure\n", __func__);
-
+#ifndef CONFIG_SEC_FACTORY
+				/* VSSH LDO enable, even if vbusdet vol drop */
+				/* Can not be charged after ovp test W/A */
+				s2mu106_update_reg(charger->i2c, 0x3C, 0x30, 0x30);
+#endif
 				value.intval = SEC_BAT_FGSRC_SWITCHING_ON;
 				psy_do_property("s2mu106-fuelgauge", set,
 					POWER_SUPPLY_EXT_PROP_INBAT_VOLTAGE_FGSRC_SWITCHING, value);
@@ -1506,6 +1569,13 @@ static int s2mu106_chg_set_property(struct power_supply *psy,
 		case POWER_SUPPLY_EXT_PROP_WIRELESS_TX_IOUT:
 			s2mu106_set_uno_iout(charger, val->intval);
 			break;
+#if !defined(CONFIG_SEC_A71_PROJECT)
+		case POWER_SUPPLY_EXT_PROP_ENABLE_HW_FACTORY_MODE:
+			pr_info("%s : HW Factory Enable\n", __func__);
+			s2mu106_update_reg(charger->i2c, 0xF3, 0x02, 0x02);
+			s2mu106_update_reg(charger->i2c, 0x88, 0x00, 0x04);
+			break;
+#endif
 		default:
 			return -EINVAL;
 		}
@@ -1842,7 +1912,7 @@ static void s2mu106_ivr_irq_work(struct work_struct *work)
 			reduce_input_current(charger);
 			ivr_cnt = 0;
 		}
-		mdelay(50);
+		msleep(50);
 
 		if (!(ivr_state & IVR_STATUS)) {
 			pr_info("%s: EXIT IVR WORK: check value (0x13:0x%02x, input current:%d)\n", __func__,

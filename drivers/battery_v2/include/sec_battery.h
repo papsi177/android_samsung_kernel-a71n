@@ -546,6 +546,9 @@ struct sec_battery_info {
 	/* test mode */
 	int test_mode;
 	bool factory_mode;
+#if !defined(CONFIG_SEC_A71_PROJECT)
+	bool factory_mode_boot_on;
+#endif
 	bool store_mode;
 
 	/* MTBF test for CMCC */

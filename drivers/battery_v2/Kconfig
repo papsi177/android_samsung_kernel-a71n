@@ -85,6 +85,11 @@ config STEP_CHARGING
 	help
 	 Say Y to include support for step charging
 
+config NEW_STEP_CHARGING_CONCEPT
+	bool "support for new_step charging_concept"
+	help
+	 Say Y to include support for new_step charging_concept
+	 
 config ENABLE_FULL_BY_SOC
 	bool "make full by soc 100%"
 	help
@@ -133,10 +138,6 @@ config SUPPORT_HV_CTRL
 	 help
 	 Say Y to include support for controlling voltage
 
-config LSI_IFPMIC
-	 bool "support for lsi ifpmic"
-	 help
-	 Say Y to include support for lsi ifpmic
 
 # Fuel Gauge
 

@@ -137,6 +137,7 @@ enum power_supply_ext_property {
 	POWER_SUPPLY_EXT_PROP_DIRECT_FLOAT_MAX,
 	POWER_SUPPLY_EXT_PROP_DIRECT_ADC_CTRL,
 	POWER_SUPPLY_EXT_PROP_DIRECT_HV_PDO,
+	POWER_SUPPLY_EXT_PROP_DIRECT_HAS_APDO,
 	POWER_SUPPLY_EXT_PROP_DIRECT_PPS,
 	POWER_SUPPLY_EXT_PROP_DIRECT_PPS_FAILED,
 	POWER_SUPPLY_EXT_PROP_DIRECT_PPS_READY,
@@ -146,6 +147,7 @@ enum power_supply_ext_property {
 	POWER_SUPPLY_EXT_PROP_DIRECT_PPS_DISABLE,
 	POWER_SUPPLY_EXT_PROP_CHANGE_CHARGING_SOURCE,
 	POWER_SUPPLY_EXT_PROP_DIRECT_TA_ALERT,
+	POWER_SUPPLY_EXT_PROP_DIRECT_CLEAR_ERR,
 #endif
 	POWER_SUPPLY_EXT_PROP_CHARGE_BOOST,
 #if defined(CONFIG_FUELGAUGE_S2MU004) || defined(CONFIG_FUELGAUGE_S2MU005) || defined(CONFIG_FUELGAUGE_S2MU106) || defined(CONFIG_FUELGAUGE_S2MU205) || defined(CONFIG_FUELGAUGE_S2MU107)
@@ -153,6 +155,9 @@ enum power_supply_ext_property {
 #endif
 	POWER_SUPPLY_EXT_PROP_WD_QBATTOFF,
 	POWER_SUPPLY_EXT_PROP_CHARGE_MODE,
+#if !defined(CONFIG_SEC_A71_PROJECT)
+	POWER_SUPPLY_EXT_PROP_ENABLE_HW_FACTORY_MODE,
+#endif
 #if defined(CONFIG_LEDS_S2MU107_FLASH) || defined(CONFIG_LEDS_S2MU106_FLASH)
 	POWER_SUPPLY_EXT_PROP_FLED_BOOST_ON,
 	POWER_SUPPLY_EXT_PROP_FLED_BOOST_OFF,
@@ -837,7 +842,7 @@ struct sec_age_data {
 	unsigned int recharge_condition_vcell;
 	unsigned int full_condition_vcell;
 	unsigned int full_condition_soc;
-#if defined(CONFIG_STEP_CHARGING)
+#if defined(CONFIG_STEP_CHARGING) && !defined(CONFIG_NEW_STEP_CHARGING_CONCEPT)
 	unsigned int step_charging_condition;
 #endif
 };
@@ -1077,6 +1082,10 @@ struct sec_battery_platform_data {
 	int chg_12v_high_temp;
 	int chg_high_temp;
 	int chg_high_temp_recovery;
+#if defined(CONFIG_DIRECT_CHARGING)
+	int dchg_high_temp;
+	int dchg_high_temp_recovery;
+#endif
 	unsigned int chg_charging_limit_current;
 #if defined(CONFIG_DUAL_BATTERY)
 	unsigned int chg_main_charging_limit_current;

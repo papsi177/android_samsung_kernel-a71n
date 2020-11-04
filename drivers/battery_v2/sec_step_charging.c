@@ -18,8 +18,9 @@
 #define STEP_CHARGING_CONDITION_CURRENT_NOW		0x10
 #define STEP_CHARGING_CONDITION_FLOAT_VOLTAGE	0x20
 #define STEP_CHARGING_CONDITION_INPUT_CURRENT		0x40
+#define STEP_CHARGING_CONDITION_SOC_INIT_ONLY		0x80 /* use this to consider SOC to decide starting step only */
 
-#define STEP_CHARGING_CONDITION_DC_INIT		(STEP_CHARGING_CONDITION_VOLTAGE | STEP_CHARGING_CONDITION_SOC)
+#define STEP_CHARGING_CONDITION_DC_INIT		(STEP_CHARGING_CONDITION_VOLTAGE | STEP_CHARGING_CONDITION_SOC | STEP_CHARGING_CONDITION_SOC_INIT_ONLY)
 
 #define DIRECT_CHARGING_FLOAT_VOLTAGE_MARGIN		20
 #define DIRECT_CHARGING_FORCE_SOC_MARGIN			10
@@ -61,7 +62,9 @@ bool sec_bat_check_step_charging(struct sec_battery_info *battery)
 	int i = 0, value = 0, soc_condition = 0;
 	static int curr_cnt = 0;
 
-	pr_info("%s\n", __func__);
+	if (!battery->step_charging_type)
+		return false;
+
 #if defined(CONFIG_SEC_FACTORY)
 	return false;
 #endif
@@ -73,20 +76,25 @@ bool sec_bat_check_step_charging(struct sec_battery_info *battery)
 		battery->pdata->step_charging_condition[0] = battery->test_step_condition;
 #endif
 
-	if (!battery->step_charging_type)
-		return false;
-
 	if (battery->step_charging_type & STEP_CHARGING_CONDITION_ONLINE) {
 #if defined(CONFIG_DIRECT_CHARGING)
 		if (is_pd_apdo_wire_type(battery->cable_type) &&
 			!((battery->current_event & SEC_BAT_CURRENT_EVENT_DC_ERR) &&
 			(battery->ta_alert_mode == OCP_NONE)))
 			return false;
+
+		if ((is_pd_apdo_wire_type(battery->cable_type) || is_pd_apdo_wire_type(battery->wire_status)) &&
+			(battery->pdic_info.sink_status.rp_currentlvl == RP_CURRENT_LEVEL3)) {
+			pr_info("%s: This cable type should be checked in dc step check\n", __func__);
+			return false;
+		}
 #endif
 		if (!is_hv_wire_type(battery->cable_type) && !(battery->cable_type == SEC_BATTERY_CABLE_PDIC) &&
 			!(battery->pdic_info.sink_status.rp_currentlvl == RP_CURRENT_LEVEL3))
 			return false;
 	}
+
+	pr_info("%s\n", __func__);
 
 	if (battery->step_charging_type & STEP_CHARGING_CONDITION_CHARGE_POWER) {
 		if (battery->max_charge_power < battery->step_charging_charge_power) {
@@ -206,6 +214,27 @@ bool sec_bat_check_dc_step_charging(struct sec_battery_info *battery)
 	if (!(battery->dc_step_chg_type & STEP_CHARGING_CONDITION_DC_INIT)) {
 		pr_info("%s : cond_vol and cond_soc are both empty\n", __func__);
 		return false;
+	}
+
+	/* this is only for step enter condition and do not use STEP_CHARGING_CONDITION_SOC at the same time */
+	if (battery->dc_step_chg_type & STEP_CHARGING_CONDITION_SOC_INIT_ONLY) {
+		if (battery->step_charging_status < 0) {
+			step_soc = i;
+			value = battery->capacity;
+			while(step_soc < battery->dc_step_chg_step - 1) {
+				soc_condition = battery->pdata->dc_step_chg_cond_soc[step_soc];
+				if (value < soc_condition)
+					break;
+				step_soc++;
+			}
+
+			if ((step_soc < step) || (step < 0))
+				step = step_soc;
+
+			pr_info("%s : set initial step(%d) by soc\n", __func__, step_soc);
+			goto check_dc_step_change;
+		} else
+			step_soc = battery->dc_step_chg_step - 1;
 	}
 
 	if (battery->dc_step_chg_type & STEP_CHARGING_CONDITION_SOC) {
@@ -416,13 +445,14 @@ int sec_dc_step_charging_dt(struct sec_battery_info *battery, struct device *dev
 		}
 	}
 
-	if (battery->dc_step_chg_type & STEP_CHARGING_CONDITION_SOC) {
+	if (battery->dc_step_chg_type & STEP_CHARGING_CONDITION_SOC ||
+		battery->dc_step_chg_type & STEP_CHARGING_CONDITION_SOC_INIT_ONLY) {
 		p = of_get_property(np, "battery,dc_step_chg_cond_soc", &len);
 		if (!p) {
 			pr_err("%s: dc_step_chg_cond_soc is Empty, type(0x%X->0x%x)\n",
 				__func__, battery->dc_step_chg_type,
-				battery->dc_step_chg_type & ~STEP_CHARGING_CONDITION_SOC);
-			battery->dc_step_chg_type &= ~STEP_CHARGING_CONDITION_SOC;
+				battery->dc_step_chg_type & ~(STEP_CHARGING_CONDITION_SOC | STEP_CHARGING_CONDITION_SOC_INIT_ONLY));
+			battery->dc_step_chg_type &= ~(STEP_CHARGING_CONDITION_SOC | STEP_CHARGING_CONDITION_SOC_INIT_ONLY);
 		} else {
 			len = len / sizeof(u32);
 
@@ -437,6 +467,12 @@ int sec_dc_step_charging_dt(struct sec_battery_info *battery, struct device *dev
 					pdata->dc_step_chg_cond_soc, len);
 			if (ret) {
 				pr_info("%s : dc_step_chg_cond_soc read fail\n", __func__);
+				battery->dc_step_chg_type &= ~STEP_CHARGING_CONDITION_SOC;
+			}
+
+			if (battery->dc_step_chg_type & STEP_CHARGING_CONDITION_SOC &&
+				battery->dc_step_chg_type & STEP_CHARGING_CONDITION_SOC_INIT_ONLY) {
+				pr_info("%s : do not set SOC and SOC_INIT_ONLY at the same time\n", __func__);
 				battery->dc_step_chg_type &= ~STEP_CHARGING_CONDITION_SOC;
 			}
 		}
@@ -563,8 +599,6 @@ void sec_bat_set_aging_info_step_charging(struct sec_battery_info *battery)
 
 	if (battery->step_charging_type & STEP_CHARGING_CONDITION_FLOAT_VOLTAGE)
 		battery->pdata->step_charging_float_voltage[battery->step_charging_step-1] = battery->pdata->chg_float_voltage;
-	battery->pdata->step_charging_condition[0] = 
-		battery->pdata->age_data[battery->pdata->age_step].step_charging_condition;
 #if defined(CONFIG_DIRECT_CHARGING)
 		for (i = 0; i < battery->dc_step_chg_step; i++) {
 			if (battery->pdata->dc_step_chg_val_vfloat[i] > battery->pdata->chg_float_voltage)
@@ -587,11 +621,13 @@ void sec_bat_set_aging_info_step_charging(struct sec_battery_info *battery)
 		}
 #endif
 
+#if defined(CONFIG_STEP_CHARGING) && !defined(CONFIG_NEW_STEP_CHARGING_CONCEPT)
 	dev_info(battery->dev,
 		 "%s: float_v(%d), step_conditon(%d)\n",
 		 __func__,
 		 battery->pdata->step_charging_float_voltage[battery->step_charging_step-1],
-		 battery->pdata->step_charging_condition[0]);	
+		 battery->pdata->step_charging_condition[0]);
+#endif
 }
 #endif
 
@@ -634,68 +670,95 @@ void sec_step_charging_init(struct sec_battery_info *battery, struct device *dev
 	if (ret) {
 		pr_err("%s: step_charging_type is Empty\n", __func__);
 		battery->step_charging_type = 0;
-		return;
 	}
-	ret = of_property_read_u32(np, "battery,step_charging_charge_power",
-			&battery->step_charging_charge_power);
-	if (ret) {
-		pr_err("%s: step_charging_charge_power is Empty\n", __func__);
-		battery->step_charging_charge_power = 20000;
-	}
-	p = of_get_property(np, "battery,step_charging_condition", &len);
-	if (!p) {
-		battery->step_charging_step = 0;
-	} else {
-		len = len / sizeof(u32);
-		battery->step_charging_step = len;
 
-		pdata->step_charging_condition = kzalloc(sizeof(u32) * len, GFP_KERNEL);
-		ret = of_property_read_u32_array(np, "battery,step_charging_condition",
-				pdata->step_charging_condition, len);
+	if (battery->step_charging_type) {
+		ret = of_property_read_u32(np, "battery,step_charging_step",
+				&battery->step_charging_step);
 		if (ret) {
-			pr_info("%s : step_charging_condition read fail\n", __func__);
+			pr_err("%s: step_charging_step is Empty\n", __func__);
 			battery->step_charging_step = 0;
+		} else {
+			pr_err("%s: step_charging_step is %d\n",
+				__func__, battery->step_charging_step);
 		}
 
-		pdata->step_charging_condition_curr = kzalloc(sizeof(u32) * len, GFP_KERNEL);
-		ret = of_property_read_u32_array(np, "battery,step_charging_condition_curr",
-				pdata->step_charging_condition_curr, len);		
+		ret = of_property_read_u32(np, "battery,step_charging_charge_power",
+				&battery->step_charging_charge_power);
 		if (ret) {
-			pr_info("%s : step_charging_condition_curr read fail\n", __func__);
+			pr_err("%s: step_charging_charge_power is Empty\n", __func__);
+			battery->step_charging_charge_power = 20000;
+		}
+
+		p = of_get_property(np, "battery,step_charging_condition", &len);
+		if (!p) {
 			battery->step_charging_step = 0;
-		} 
-
-		if(len > 0) {
-			pdata->step_charging_float_voltage = kzalloc(sizeof(u32) * len, GFP_KERNEL);
-			ret = of_property_read_u32_array(np, "battery,step_charging_float_voltage",
-					pdata->step_charging_float_voltage, len);
+		} else {
+			len = len / sizeof(u32);
+			battery->step_charging_step = len;
+			pdata->step_charging_condition = kzalloc(sizeof(u32) * len, GFP_KERNEL);
+			ret = of_property_read_u32_array(np, "battery,step_charging_condition",
+					pdata->step_charging_condition, len);
 			if (ret) {
-				pr_info("%s : step_charging_float_voltage read fail\n", __func__);
-			} else {
-				for (i = 0; i < len; i++) {
-					pr_info("%s : step condition(%d), float voltage(%d)\n",
-					__func__, pdata->step_charging_condition[i],
-					pdata->step_charging_float_voltage[i]);
-				}
-			}
-
-			pdata->step_charging_current = kzalloc(sizeof(u32) * len, GFP_KERNEL);
-			ret = of_property_read_u32_array(np, "battery,step_charging_current",
-					pdata->step_charging_current, len);
-			if (ret) {
-				pr_info("%s : step_charging_current read fail\n", __func__);
+				pr_info("%s : step_charging_condition read fail\n", __func__);
 				battery->step_charging_step = 0;
+			}
+
+			p = of_get_property(np, "battery,step_charging_condition_curr", &len);
+			if (!p) {
+				pr_err("%s: step_charging_condition_curr is Empty\n", __func__);
 			} else {
-				battery->step_charging_status = -1;
-				for (i = 0; i < len; i++) {
-					pr_info("%s : step condition(%d), current(%d)\n",
-					__func__, pdata->step_charging_condition[i],
-					pdata->step_charging_current[i]);
+				len = len / sizeof(u32);
+				pdata->step_charging_condition_curr = kzalloc(sizeof(u32) * len, GFP_KERNEL);
+				ret = of_property_read_u32_array(np, "battery,step_charging_condition_curr",
+						pdata->step_charging_condition_curr, len);
+				if (ret) {
+					pr_info("%s : step_charging_condition_curr read fail\n", __func__);
+					battery->step_charging_step = 0;
+				}
+			}
+
+			p = of_get_property(np, "battery,step_charging_float_voltage", &len);
+			if (!p) {
+				pr_err("%s: step_charging_float_voltage is Empty\n", __func__);
+			} else {
+				len = len / sizeof(u32);
+				pdata->step_charging_float_voltage = kzalloc(sizeof(u32) * len, GFP_KERNEL);
+				ret = of_property_read_u32_array(np, "battery,step_charging_float_voltage",
+						pdata->step_charging_float_voltage, len);
+				if (ret) {
+					pr_info("%s : step_charging_float_voltage read fail\n", __func__);
+				} else {
+					for (i = 0; i < len; i++) {
+						pr_info("%s : step condition(%d), float voltage(%d)\n",
+						__func__, pdata->step_charging_condition[i],
+						pdata->step_charging_float_voltage[i]);
+					}
+				}
+			}
+
+			p = of_get_property(np, "battery,step_charging_current", &len);
+			if (!p) {
+				pr_err("%s: step_charging_current is Empty\n", __func__);
+			} else {
+				len = len / sizeof(u32);
+				pdata->step_charging_current = kzalloc(sizeof(u32) * len, GFP_KERNEL);
+				ret = of_property_read_u32_array(np, "battery,step_charging_current",
+						pdata->step_charging_current, len);
+				if (ret) {
+					pr_info("%s : step_charging_current read fail\n", __func__);
+					battery->step_charging_step = 0;
+				} else {
+					battery->step_charging_status = -1;
+					for (i = 0; i < len; i++) {
+						pr_info("%s : step condition(%d), current(%d)\n",
+						__func__, pdata->step_charging_condition[i],
+						pdata->step_charging_current[i]);
+					}
 				}
 			}
 		}
 	}
-
 #if defined(CONFIG_DIRECT_CHARGING)
 	sec_dc_step_charging_dt(battery, dev);
 #endif

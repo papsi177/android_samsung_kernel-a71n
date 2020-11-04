@@ -109,11 +109,11 @@ static int pca9468_update_reg(struct pca9468_charger *pca9468, int reg, u8 mask,
 		if (val == PCA9468_STANDBY_DONOT) {
 			pr_info("%s: PCA9468_STANDBY_DONOT 50ms\n", __func__);
 			/* Wait 50ms, first to keep the start-up sequence */
-			mdelay(50);
+			msleep(50);
 		} else {
 			pr_info("%s: PCA9468_STANDBY_FORCED 5ms\n", __func__);
 			/* Wait 5ms to keep the shutdown sequence */
-			mdelay(5);
+			usleep_range(5000, 6000);
 		}
 	}
 	mutex_unlock(&pca9468->i2c_lock);
@@ -192,8 +192,8 @@ static void pca9468_test_read(struct pca9468_charger *pca9468)
 		pca9468_read_reg(pca9468, address, &val);
 		sprintf(str + strlen(str), "[0x%02x]0x%02x, ", address, val);
 	}
-
-	pr_info("## pca9468 : [DC_CPEN:%d]%s\n", gpio_get_value(pca9468->pdata->chgen_gpio), str);
+	if (pca9468->pdata->chgen_gpio >= 0)
+		pr_info("## pca9468 : [DC_CPEN:%d]%s\n", gpio_get_value(pca9468->pdata->chgen_gpio), str);
 }
 
 static void pca9468_monitor_work(struct pca9468_charger *pca9468)
@@ -247,7 +247,6 @@ static void pca9468_set_wdt_timer(struct pca9468_charger *pca9468, int time)
 	pr_info("%s: set wdt time = %d\n", __func__, time);
 }
 
-#if defined(CONFIG_ENG_BATTERY_CONCEPT)
 static void pca9468_check_wdt_control(struct pca9468_charger *pca9468)
 {
 	struct device *dev = pca9468->dev;
@@ -284,7 +283,6 @@ static void pca9468_wdt_control_work(struct work_struct *work)
 	pr_info("## %s: disable slave addr (vin:%dmV, iin:%dmA)\n",
 		__func__, vin/PCA9468_SEC_DENOM_U_M, iin/PCA9468_SEC_DENOM_U_M);
 }
-#endif
 
 static void pca9468_set_done(struct pca9468_charger *pca9468, bool enable)
 {
@@ -2954,11 +2952,7 @@ static int pca9468_start_direct_charging(struct pca9468_charger *pca9468)
 #if defined(CONFIG_BATTERY_SAMSUNG)
 	/* Set watchdog timer enable */
 	pca9468_set_wdt_enable(pca9468, WDT_ENABLE);
-#if defined(CONFIG_ENG_BATTERY_CONCEPT)
 	pca9468_check_wdt_control(pca9468);
-#else
-	pca9468_set_wdt_timer(pca9468, WDT_8SEC);
-#endif
 #endif
 
 	/* Set Switching Frequency */
@@ -3881,7 +3875,7 @@ static int pca9468_chg_set_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_MAX ... POWER_SUPPLY_EXT_PROP_MAX:
 		switch (ext_psp) {
-#if defined(CONFIG_BATTERY_SAMSUNG) && defined(CONFIG_ENG_BATTERY_CONCEPT)
+#if defined(CONFIG_BATTERY_SAMSUNG)
 		case POWER_SUPPLY_EXT_PROP_DIRECT_WDT_CONTROL:
 			if (val->intval) {
 				pca9468->wdt_kick = true;
@@ -4204,7 +4198,6 @@ static int pca9468_charger_parse_dt(struct device *dev, struct pca9468_platform_
 	if (pdata->chgen_gpio < 0) {
 		pr_err("%s : cannot get chgen gpio : %d\n",
 			__func__, pdata->chgen_gpio);
-		return -ENODATA;	
 	} else {
 		pr_info("%s: chgen gpio : %d\n", __func__, pdata->chgen_gpio);
 	}
@@ -4401,7 +4394,7 @@ static int pca9468_charger_probe(struct i2c_client *client,
 	mutex_unlock(&pca9468_chg->lock);
 
 	INIT_DELAYED_WORK(&pca9468_chg->pps_work, pca9468_pps_request_work);
-#if defined(CONFIG_BATTERY_SAMSUNG) && defined(CONFIG_ENG_BATTERY_CONCEPT)
+#if defined(CONFIG_BATTERY_SAMSUNG)
 	INIT_DELAYED_WORK(&pca9468_chg->wdt_control_work, pca9468_wdt_control_work);
 #endif
 
@@ -4463,14 +4456,16 @@ static int pca9468_charger_probe(struct i2c_client *client,
 	}
 
 #if defined(CONFIG_BATTERY_SAMSUNG)
-	ret = gpio_request(pdata->chgen_gpio, "DC_CPEN");
-	if (ret) {
-		pr_info("%s : Request GPIO %d failed\n",
-				__func__, (int)pdata->chgen_gpio);
-	}
+	if(pdata->chgen_gpio >= 0) {
+		ret = gpio_request(pdata->chgen_gpio, "DC_CPEN");
+		if (ret) {
+			pr_info("%s : Request GPIO %d failed\n",
+					__func__, (int)pdata->chgen_gpio);
+		}
 
-	gpio_direction_output(pdata->chgen_gpio,
-			false);
+		gpio_direction_output(pdata->chgen_gpio,
+				false);
+	}
 #endif
 
 	ret = pca9468_create_debugfs_entries(pca9468_chg);
