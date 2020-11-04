@@ -306,6 +306,9 @@ void sec_debug_update_restart_reason(const char *cmd, const int in_panic,
 		{ "userrequested",
 			PON_RESTART_REASON_NORMALBOOT,
 			RESTART_REASON_NOT_HANDLE, NULL},
+		{ "silent.sec",
+			PON_RESTART_REASON_NORMALBOOT,
+			RESTART_REASON_NOT_HANDLE, NULL },
 		{ "oem-",
 			PON_RESTART_REASON_UNKNOWN,
 			RESTART_REASON_NORMAL, NULL},
@@ -492,6 +495,7 @@ struct __upload_cause upload_cause_st[] = {
 	{ "npu", UPLOAD_CAUSE_NPU_ERROR_FATAL, SEC_STRNSTR },
 	{ "cdsp", UPLOAD_CAUSE_CDSP_ERROR_FATAL, SEC_STRNSTR },
 	{ "MDM Crash", UPLOAD_CAUSE_MDM_ERROR_FATAL, SEC_STRNCMP },
+	{ "unrecoverable external_modem", UPLOAD_CAUSE_MDM_CRITICAL_FATAL, SEC_STRNSTR },
 	{ "external_modem", UPLOAD_CAUSE_MDM_ERROR_FATAL, SEC_STRNSTR },
 	{ "esoc0 crashed", UPLOAD_CAUSE_MDM_ERROR_FATAL, SEC_STRNSTR },
 	{ "modem", UPLOAD_CAUSE_MODEM_RST_ERR, SEC_STRNSTR },
@@ -499,6 +503,7 @@ struct __upload_cause upload_cause_st[] = {
 	{ "lpass", UPLOAD_CAUSE_LPASS_RST_ERR, SEC_STRNSTR },
 	{ "dsps", UPLOAD_CAUSE_DSPS_RST_ERR, SEC_STRNSTR },
 	{ "subsys", UPLOAD_CAUSE_PERIPHERAL_ERR, SEC_STRNCASECMP },
+	{ "SMPL", UPLOAD_CAUSE_SMPL, SEC_STRNSTR },
 #if defined(CONFIG_SEC_QUEST)
 	{ "crypto_test", UPLOAD_CAUSE_QUEST_CRYPTO, SEC_STRNCMP },
 	{ "icache_test", UPLOAD_CAUSE_QUEST_ICACHE, SEC_STRNCMP },
@@ -598,10 +603,9 @@ static int sec_debug_panic_handler(struct notifier_block *nb,
 	/* enable after SSR feature */
 	/* ssr_panic_handler_for_sec_dbg(); */
 
-	show_state_filter(TASK_UNINTERRUPTIBLE);
-
 	/* platform lockup suspected, it needs more info */
 	if (sec_debug_platform_lockup_suspected((char *)buf)) {
+		show_state_filter(TASK_UNINTERRUPTIBLE);
 		dump_memory_info();
 		dump_cpu_stat();
 	}
