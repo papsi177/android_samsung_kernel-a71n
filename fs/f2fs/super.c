@@ -277,6 +277,44 @@ out_unlock:
 	return;
 }
 
+void f2fs_get_fsck_stat(struct f2fs_sb_info *sbi)
+{
+	struct f2fs_super_block *fsb = sbi->raw_super;
+	unsigned long long extra_flag_blk_no = le32_to_cpu(fsb->cp_blkaddr) - 1;
+
+	struct buffer_head *bh;
+	struct f2fs_sb_extra_flag_blk *extra_blk;
+
+	if (extra_flag_blk_no < 2) {
+		f2fs_msg(sbi->sb, KERN_WARNING, 
+				"extra_flag: No free blks for extra flags");
+		return;
+	}
+
+	bh = sb_bread(sbi->sb, (sector_t)extra_flag_blk_no);
+	if (!bh) {
+		f2fs_msg(sbi->sb, KERN_WARNING, 
+				"extra_flag: Fail to allocate buffer_head");
+		return;
+	}
+
+	extra_blk = (struct f2fs_sb_extra_flag_blk*)bh->b_data;
+	sbi->sec_fsck_stat.fsck_elapsed_time =
+			le64_to_cpu(extra_blk->fsck_elapsed_time);
+	sbi->sec_fsck_stat.fsck_read_bytes =
+			le64_to_cpu(extra_blk->fsck_read_bytes);
+	sbi->sec_fsck_stat.fsck_written_bytes =
+			le64_to_cpu(extra_blk->fsck_written_bytes);
+	sbi->sec_fsck_stat.fsck_exit_code =
+			le32_to_cpu(extra_blk->fsck_exit_code);
+	sbi->sec_fsck_stat.valid_node_count =
+			le32_to_cpu(extra_blk->valid_node_count);
+	sbi->sec_fsck_stat.valid_inode_count =
+			le32_to_cpu(extra_blk->valid_inode_count);
+
+	brelse(bh);
+}
+
 static inline void limit_reserve_root(struct f2fs_sb_info *sbi)
 {
 	block_t limit = sbi->user_block_count / 100;
@@ -1612,6 +1650,7 @@ static int f2fs_disable_checkpoint(struct f2fs_sb_info *sbi)
 	unsigned int s_flags = sbi->sb->s_flags;
 	struct cp_control cpc;
 	int err = 0;
+	unsigned int retry_cnt = 0;
 	int ret;
 
 	if (s_flags & SB_RDONLY) {
@@ -1624,6 +1663,7 @@ static int f2fs_disable_checkpoint(struct f2fs_sb_info *sbi)
 	f2fs_update_time(sbi, DISABLE_TIME);
 
 	while (!f2fs_time_over(sbi, DISABLE_TIME)) {
+		retry_cnt++;
 		mutex_lock(&sbi->gc_mutex);
 		err = f2fs_gc(sbi, true, false, NULL_SEGNO);
 		if (err == -ENODATA) {
@@ -1634,17 +1674,27 @@ static int f2fs_disable_checkpoint(struct f2fs_sb_info *sbi)
 			break;
 	}
 
+	if (err == -EAGAIN) {
+		f2fs_msg(sbi->sb, KERN_INFO, 
+				"%s: f2fs_gc = -EAGAIN (retry_cnt : %u)", 
+				__func__, retry_cnt);
+		err = 0;
+	}
+
 	ret = sync_filesystem(sbi->sb);
 	if (ret || err) {
 		err = ret ? ret: err;
 		goto restore_flag;
 	}
 
+// DISABLE_TIMEOUT -> 15s, Permit alloc SSR ==> Do not need cp_again
+// P191218-00524
+#if 0
 	if (f2fs_disable_cp_again(sbi)) {
 		err = -EAGAIN;
 		goto restore_flag;
 	}
-
+#endif
 	mutex_lock(&sbi->gc_mutex);
 	cpc.reason = CP_PAUSE;
 	set_sbi_flag(sbi, SBI_CP_DISABLED);
@@ -2919,6 +2969,9 @@ static void init_sb_info(struct f2fs_sb_info *sbi)
 
 	sbi->dirty_device = 0;
 	spin_lock_init(&sbi->dev_lock);
+
+	/* FUA Mode : ROOT & Quota */
+	sbi->s_sec_cond_fua_mode = F2FS_SEC_FUA_ROOT;
 
 	init_rwsem(&sbi->sb_lock);
 }
