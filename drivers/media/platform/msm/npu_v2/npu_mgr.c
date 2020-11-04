@@ -10,11 +10,8 @@
  * GNU General Public License for more details.
  */
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
-/* -------------------------------------------------------------------------
+/*
  * Includes
- * -------------------------------------------------------------------------
  */
 #include "npu_hw_access.h"
 #include "npu_mgr.h"
@@ -22,28 +19,32 @@
 #include "npu_hw.h"
 #include "npu_host_ipc.h"
 #include "npu_common.h"
+#include <soc/qcom/subsystem_notif.h>
+#include <soc/qcom/subsystem_restart.h>
 
-/* -------------------------------------------------------------------------
+/*
  * Defines
- * -------------------------------------------------------------------------
  */
 #define LOG_MSG_HEADER_SIZE      20
 #define LOG_MSG_START_MSG_INDEX  5
 #define LOG_MSG_TOTAL_SIZE_INDEX 0
 #define LOG_MSG_MSG_ID_INDEX     1
 
-#define NPU_FW_TIMEOUT_POLL_INTERVAL_MS  20
-#define NPU_FW_TIMEOUT_MS                1000
+#define NPU_FW_TIMEOUT_POLL_INTERVAL_MS  10
+#define NPU_FW_TIMEOUT_MS                5000
 
-/* -------------------------------------------------------------------------
+/*
  * File Scope Function Prototypes
- * -------------------------------------------------------------------------
  */
-static void host_irq_wq(struct work_struct *work);
-static void fw_deinit_wq(struct work_struct *work);
+static void npu_ipc_irq_work(struct work_struct *work);
+static void npu_wdg_err_irq_work(struct work_struct *work);
+static void npu_bridge_mbox_work(struct work_struct *work);
+static void npu_disable_fw_work(struct work_struct *work);
+static void npu_update_pwr_work(struct work_struct *work);
 static void turn_off_fw_logging(struct npu_device *npu_dev);
 static int wait_for_status_ready(struct npu_device *npu_dev,
-	uint32_t status_reg, uint32_t status_bits);
+	uint32_t status_reg, uint32_t status_bits, bool poll);
+static int wait_npu_cpc_power_off(struct npu_device *npu_dev);
 static struct npu_network *alloc_network(struct npu_host_ctx *ctx,
 	struct npu_client *client);
 static struct npu_network *get_network_by_hdl(struct npu_host_ctx *ctx,
@@ -60,263 +61,619 @@ static void host_session_msg_hdlr(struct npu_device *npu_dev);
 static void host_session_log_hdlr(struct npu_device *npu_dev);
 static int host_error_hdlr(struct npu_device *npu_dev, bool force);
 static int npu_send_network_cmd(struct npu_device *npu_dev,
-	struct npu_network *network, void *cmd_ptr, bool async);
+	struct npu_network *network, void *cmd_ptr, bool async, bool force);
 static int npu_send_misc_cmd(struct npu_device *npu_dev, uint32_t q_idx,
 	void *cmd_ptr);
 static int npu_queue_event(struct npu_client *client, struct npu_kevent *evt);
-static int npu_notify_dsp(struct npu_device *npu_dev, bool pwr_up);
 static int npu_notify_aop(struct npu_device *npu_dev, bool on);
+static int npu_notify_fw_pwr_state(struct npu_device *npu_dev,
+	uint32_t pwr_level, bool post);
+static int load_fw_nolock(struct npu_device *npu_dev, bool enable);
+static void disable_fw_nolock(struct npu_device *npu_dev);
 static int update_dcvs_activity(struct npu_device *npu_dev, uint32_t activity);
-static void npu_destroy_wq(struct npu_host_ctx *host_ctx);
-static struct workqueue_struct *npu_create_wq(struct npu_host_ctx *host_ctx,
-	const char *name);
 
-/* -------------------------------------------------------------------------
+/*
  * Function Definitions - Init / Deinit
- * -------------------------------------------------------------------------
  */
-int fw_init(struct npu_device *npu_dev)
-{
-	uint32_t reg_val;
-	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
-	int ret = 0, retry_cnt = 3;
-	bool need_retry;
 
-	mutex_lock(&host_ctx->lock);
-	if (host_ctx->fw_state == FW_ENABLED) {
-		host_ctx->fw_ref_cnt++;
-		pr_debug("fw_ref_cnt %d\n", host_ctx->fw_ref_cnt);
-		mutex_unlock(&host_ctx->lock);
+static int wait_npu_cpc_power_off(struct npu_device *npu_dev)
+{
+	uint32_t reg_val = NPU_CPC_PWR_ON;
+	uint32_t wait_cnt = 0, max_wait_ms;
+
+	max_wait_ms = NPU_FW_TIMEOUT_MS;
+
+	do {
+		reg_val = npu_tcsr_reg_read(npu_dev, TCSR_NPU_CPC_PWR_ON);
+		if (!(reg_val & NPU_CPC_PWR_ON)) {
+			NPU_DBG("npu cpc powers off\n");
+			break;
+		}
+
+		wait_cnt += NPU_FW_TIMEOUT_POLL_INTERVAL_MS;
+		if (wait_cnt > max_wait_ms) {
+			NPU_ERR("timeout wait for cpc power off\n");
+			return -EPERM;
+		}
+		msleep(NPU_FW_TIMEOUT_POLL_INTERVAL_MS);
+	} while (1);
+
+	return 0;
+}
+
+static int load_fw_nolock(struct npu_device *npu_dev, bool enable)
+{
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+	int ret = 0;
+
+	if (host_ctx->fw_state != FW_UNLOADED) {
+		NPU_WARN("fw is loaded already\n");
 		return 0;
 	}
 
-retry:
-	need_retry = false;
-	npu_notify_aop(npu_dev, true);
-
-	if (npu_enable_core_power(npu_dev)) {
-		ret = -EPERM;
-		goto enable_pw_fail;
-	}
-
-	if (npu_enable_sys_cache(npu_dev)) {
-		ret = -EPERM;
-		goto enable_sys_cache_fail;
-	}
-
 	/* Boot the NPU subsystem */
+	reinit_completion(&host_ctx->npu_power_up_done);
 	host_ctx->subsystem_handle = subsystem_get_local("npu");
-	if (IS_ERR(host_ctx->subsystem_handle)) {
-		pr_err("pil load npu fw failed\n");
+	if (IS_ERR_OR_NULL(host_ctx->subsystem_handle)) {
+		NPU_ERR("pil load npu fw failed\n");
+		host_ctx->subsystem_handle = NULL;
 		ret = -ENODEV;
-		goto subsystem_get_fail;
+		goto load_fw_fail;
 	}
 
-	/* Clear control/status registers */
-	REGW(npu_dev, REG_NPU_FW_CTRL_STATUS, 0x0);
-	REGW(npu_dev, REG_NPU_HOST_CTRL_VALUE, 0x0);
-	REGW(npu_dev, REG_FW_TO_HOST_EVENT, 0x0);
-
-	pr_debug("fw_dbg_mode %x\n", host_ctx->fw_dbg_mode);
-	reg_val = 0;
-	if (host_ctx->fw_dbg_mode & FW_DBG_MODE_PAUSE)
-		reg_val |= HOST_CTRL_STATUS_FW_PAUSE_VAL;
-
-	if (host_ctx->fw_dbg_mode & FW_DBG_DISABLE_WDOG)
-		reg_val |= HOST_CTRL_STATUS_DISABLE_WDOG_VAL;
-
-	REGW(npu_dev, REG_NPU_HOST_CTRL_STATUS, reg_val);
-	/* Read back to flush all registers for fw to read */
-	REGR(npu_dev, REG_NPU_HOST_CTRL_STATUS);
-
-	/* Post PIL clocks */
-	if (npu_enable_post_pil_clocks(npu_dev)) {
-		ret = -EPERM;
-		goto enable_post_clk_fail;
-	}
-
-	/*
-	 * Set logging state and clock gating state
-	 * during FW bootup initialization
-	 */
-	reg_val = REGR(npu_dev, REG_NPU_HOST_CTRL_STATUS);
-
-	/* Enable clock gating only if the HW access platform allows it */
-	if (npu_hw_clk_gating_enabled())
-		reg_val |= HOST_CTRL_STATUS_BOOT_ENABLE_CLK_GATE_VAL;
-
-	REGW(npu_dev, REG_NPU_HOST_CTRL_STATUS, reg_val);
-
-	/* Initialize the host side IPC */
-	ret = npu_host_ipc_pre_init(npu_dev);
-	if (ret) {
-		pr_err("npu_host_ipc_pre_init failed %d\n", ret);
-		goto enable_post_clk_fail;
+	ret = wait_for_completion_timeout(
+		&host_ctx->npu_power_up_done, NW_CMD_TIMEOUT);
+	if (!ret) {
+		NPU_ERR("Wait for npu powers up timed out\n");
+		ret = -ETIMEDOUT;
+		goto load_fw_fail;
 	}
 
 	/* Keep reading ctrl status until NPU is ready */
-	pr_err("waiting for status ready from fw\n");
-
 	if (wait_for_status_ready(npu_dev, REG_NPU_FW_CTRL_STATUS,
-		FW_CTRL_STATUS_MAIN_THREAD_READY_VAL)) {
+		FW_CTRL_STATUS_MAIN_THREAD_READY_VAL, false)) {
 		ret = -EPERM;
-		need_retry = true;
-		goto wait_fw_ready_fail;
+		goto load_fw_fail;
 	}
 
 	npu_host_ipc_post_init(npu_dev);
+	NPU_DBG("firmware init complete\n");
 
-	if (npu_enable_irq(npu_dev)) {
-		ret = -EPERM;
-		goto wait_fw_ready_fail;
+	host_ctx->fw_state = FW_ENABLED;
+	ret = npu_enable_irq(npu_dev);
+	if (ret) {
+		NPU_ERR("Enable irq failed\n");
+		goto load_fw_fail;
 	}
 
-	npu_notify_dsp(npu_dev, true);
+	if (enable) {
+		ret = npu_notify_fw_pwr_state(npu_dev,
+			npu_dev->pwrctrl.active_pwrlevel, true);
+		if (ret) {
+			NPU_ERR("notify fw pwr on failed\n");
+			goto load_fw_fail;
+		}
+		return ret;
+	}
+
+	reinit_completion(&host_ctx->fw_shutdown_done);
+	ret = npu_notify_fw_pwr_state(npu_dev, NPU_PWRLEVEL_OFF, false);
+	if (ret) {
+		NPU_ERR("notify fw pwr off failed\n");
+		goto load_fw_fail;
+	}
+
+	ret = wait_for_completion_timeout(
+		&host_ctx->fw_shutdown_done, NW_CMD_TIMEOUT);
+	if (!ret) {
+		NPU_ERR("Wait for fw shutdown timedout\n");
+		ret = -ETIMEDOUT;
+	} else {
+		ret = wait_npu_cpc_power_off(npu_dev);
+	}
+
+load_fw_fail:
+	npu_disable_irq(npu_dev);
+	npu_disable_sys_cache(npu_dev);
+	npu_disable_core_power(npu_dev);
+	npu_notify_aop(npu_dev, false);
+	if (!ret) {
+		host_ctx->fw_state = FW_LOADED;
+	} else {
+		if (!IS_ERR_OR_NULL(host_ctx->subsystem_handle))
+			subsystem_put_local(host_ctx->subsystem_handle);
+
+		host_ctx->fw_state = FW_UNLOADED;
+	}
+
+	return ret;
+}
+
+static void npu_load_fw_work(struct work_struct *work)
+{
+	int ret;
+	struct npu_host_ctx *host_ctx;
+	struct npu_device *npu_dev;
+
+	host_ctx = container_of(work, struct npu_host_ctx, load_fw_work);
+	npu_dev = container_of(host_ctx, struct npu_device, host_ctx);
+
+	mutex_lock(&host_ctx->lock);
+	ret = load_fw_nolock(npu_dev, false);
+	mutex_unlock(&host_ctx->lock);
+
+	if (ret)
+		NPU_ERR("load fw failed %d\n", ret);
+}
+
+int load_fw(struct npu_device *npu_dev)
+{
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+
+	if (host_ctx->auto_pil_disable) {
+		NPU_WARN("auto pil is disabled\n");
+		return -EINVAL;
+	}
+
+	if (host_ctx->wq)
+		queue_work(host_ctx->wq, &host_ctx->load_fw_work);
+
+	return 0;
+}
+
+int unload_fw(struct npu_device *npu_dev)
+{
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+
+	if (host_ctx->auto_pil_disable) {
+		NPU_WARN("auto pil is disabled\n");
+		return 0;
+	}
+
+	mutex_lock(&host_ctx->lock);
+	if (host_ctx->fw_state == FW_UNLOADED) {
+		NPU_INFO("fw is unloaded already\n");
+		mutex_unlock(&host_ctx->lock);
+		return 0;
+	} else if (host_ctx->fw_state == FW_ENABLED) {
+		NPU_ERR("fw is enabled now, can't be unloaded\n");
+		mutex_unlock(&host_ctx->lock);
+		return -EBUSY;
+	}
+
+	subsystem_put_local(host_ctx->subsystem_handle);
+	host_ctx->fw_state = FW_UNLOADED;
+	NPU_DBG("fw is unloaded\n");
+	mutex_unlock(&host_ctx->lock);
+
+	return 0;
+}
+
+static int enable_fw_nolock(struct npu_device *npu_dev)
+{
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+	int ret = 0;
+
+	if (host_ctx->fw_state == FW_UNLOADED) {
+		ret = load_fw_nolock(npu_dev,
+			host_ctx->auto_pil_disable ? true : false);
+		if (ret) {
+			NPU_ERR("load fw failed\n");
+			return ret;
+		}
+
+		if (host_ctx->auto_pil_disable) {
+			host_ctx->fw_error = false;
+			host_ctx->fw_ref_cnt++;
+			mutex_unlock(&host_ctx->lock);
+			goto enable_log;
+		}
+	}
+
+	if (host_ctx->fw_state == FW_ENABLED) {
+		host_ctx->fw_ref_cnt++;
+		NPU_DBG("fw_ref_cnt %d\n", host_ctx->fw_ref_cnt);
+		return 0;
+	}
+
+	npu_notify_aop(npu_dev, true);
+
+	ret = npu_enable_core_power(npu_dev);
+	if (ret) {
+		NPU_ERR("Enable core power failed\n");
+		goto enable_pw_fail;
+	}
+
+	ret = npu_enable_sys_cache(npu_dev);
+	if (ret) {
+		NPU_ERR("Enable sys cache failed\n");
+		goto enable_sys_cache_fail;
+	}
+
+	/* Initialize the host side IPC before fw boots up */
+	npu_host_ipc_pre_init(npu_dev);
+	npu_host_ipc_post_init(npu_dev);
+
+	ret = npu_enable_irq(npu_dev);
+	if (ret) {
+		NPU_ERR("Enable irq failed\n");
+		goto enable_irq_fail;
+	}
+
+	/* set fw_state to FW_ENABLED before send IPC command */
 	host_ctx->fw_state = FW_ENABLED;
+
+	NPU_DBG("NPU powers up\n");
+
+	/* turn on auto ACK for warm boots up */
+	npu_cc_reg_write(npu_dev, NPU_CC_NPU_CPC_RSC_CTRL, 3);
+	reinit_completion(&host_ctx->fw_bringup_done);
+	ret = npu_notify_fw_pwr_state(npu_dev, npu_dev->pwrctrl.active_pwrlevel,
+		true);
+	if (ret) {
+		NPU_ERR("notify fw power state failed\n");
+		goto notify_fw_pwr_fail;
+	}
+
+	ret = wait_for_completion_timeout(
+		&host_ctx->fw_bringup_done, NW_CMD_TIMEOUT);
+	if (!ret) {
+		NPU_ERR("Wait for fw bringup timedout\n");
+		ret = -ETIMEDOUT;
+		goto notify_fw_pwr_fail;
+	} else {
+		ret = 0;
+	}
+
 	host_ctx->fw_error = false;
 	host_ctx->fw_ref_cnt++;
-	reinit_completion(&host_ctx->fw_deinit_done);
-
-	mutex_unlock(&host_ctx->lock);
-	pr_err("firmware init complete\n");
-	pr_err("fw_ref_cnt %d\n", host_ctx->fw_ref_cnt);
 
 
+enable_log:
 	/* Set logging state */
 	if (!npu_hw_log_enabled()) {
-		pr_debug("fw logging disabled\n");
+		NPU_DBG("fw logging disabled\n");
 		turn_off_fw_logging(npu_dev);
 	}
 
 	return ret;
 
-wait_fw_ready_fail:
-	npu_disable_post_pil_clocks(npu_dev);
-enable_post_clk_fail:
-	subsystem_put_local(host_ctx->subsystem_handle);
-subsystem_get_fail:
+notify_fw_pwr_fail:
+	host_ctx->fw_state = FW_LOADED;
+	npu_disable_irq(npu_dev);
+enable_irq_fail:
 	npu_disable_sys_cache(npu_dev);
 enable_sys_cache_fail:
 	npu_disable_core_power(npu_dev);
 enable_pw_fail:
-	npu_notify_aop(npu_dev, false);
-	host_ctx->fw_state = FW_DISABLED;
-	if (need_retry && (retry_cnt > 0)) {
-		retry_cnt--;
-		pr_warn("retry fw init %d\n", retry_cnt);
-		goto retry;
-	}
-	mutex_unlock(&host_ctx->lock);
 	return ret;
 }
 
-void fw_deinit(struct npu_device *npu_dev, bool ssr, bool fw_alive)
+int enable_fw(struct npu_device *npu_dev)
 {
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
-	struct ipc_cmd_shutdown_pkt cmd_shutdown_pkt;
-	struct npu_network *network = NULL;
-	int ret = 0, i;
+	int ret;
 
 	mutex_lock(&host_ctx->lock);
-	if (!ssr && (host_ctx->fw_ref_cnt > 0))
-		host_ctx->fw_ref_cnt--;
+	ret = enable_fw_nolock(npu_dev);
+	mutex_unlock(&host_ctx->lock);
 
-	pr_err("fw_ref_cnt %d\n", host_ctx->fw_ref_cnt);
+	return ret;
+}
 
-	if (host_ctx->fw_state != FW_ENABLED) {
-		pr_err("fw is not enabled\n");
-		mutex_unlock(&host_ctx->lock);
+static void disable_fw_nolock(struct npu_device *npu_dev)
+{
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+	int ret = 0;
+
+	if (!host_ctx->fw_ref_cnt) {
+		NPU_WARN("fw_ref_cnt is 0\n");
 		return;
 	}
 
-	if ((host_ctx->fw_ref_cnt > 0) && !ssr) {
-		mutex_unlock(&host_ctx->lock);
+	host_ctx->fw_ref_cnt--;
+	NPU_DBG("fw_ref_cnt %d\n", host_ctx->fw_ref_cnt);
+
+	if (host_ctx->fw_state != FW_ENABLED) {
+		NPU_ERR("fw is not enabled\n");
 		return;
+	}
+
+	if (host_ctx->fw_ref_cnt > 0)
+		return;
+
+	/* turn on auto ACK for warm shuts down */
+	npu_cc_reg_write(npu_dev, NPU_CC_NPU_CPC_RSC_CTRL, 3);
+	reinit_completion(&host_ctx->fw_shutdown_done);
+	if (npu_notify_fw_pwr_state(npu_dev, NPU_PWRLEVEL_OFF, false)) {
+		NPU_WARN("notify fw pwr off failed\n");
+		msleep(500);
+	}
+
+	if (!host_ctx->auto_pil_disable) {
+		ret = wait_for_completion_timeout(
+			&host_ctx->fw_shutdown_done, NW_CMD_TIMEOUT);
+		if (!ret)
+			NPU_ERR("Wait for fw shutdown timedout\n");
+		else
+			ret = wait_npu_cpc_power_off(npu_dev);
 	}
 
 	npu_disable_irq(npu_dev);
+	npu_disable_sys_cache(npu_dev);
+	npu_disable_core_power(npu_dev);
+	host_ctx->fw_state = FW_LOADED;
 
-	if (fw_alive) {
-		/* Command header */
-		cmd_shutdown_pkt.header.cmd_type = NPU_IPC_CMD_SHUTDOWN;
-		cmd_shutdown_pkt.header.size =
-			sizeof(struct ipc_cmd_shutdown_pkt);
-		cmd_shutdown_pkt.header.trans_id =
-			atomic_add_return(1, &host_ctx->ipc_trans_id);
-		cmd_shutdown_pkt.header.flags = 0xF;
-		ret = npu_host_ipc_send_cmd(npu_dev,
-			IPC_QUEUE_CMD_HIGH_PRIORITY, &cmd_shutdown_pkt);
+	NPU_DBG("firmware is disabled\n");
+	npu_notify_aop(npu_dev, false);
+	complete(&host_ctx->fw_deinit_done);
 
-		pr_err("NPU_IPC_CMD_SHUTDOWN sent status: %d\n", ret);
+	if (host_ctx->auto_pil_disable) {
+		subsystem_put_local(host_ctx->subsystem_handle);
+		host_ctx->fw_state = FW_UNLOADED;
+		NPU_DBG("fw is unloaded\n");
+	}
+}
 
-		if (ret) {
-			pr_err("npu_host_ipc_send_cmd failed\n");
-		} else {
-			/* Keep reading ctrl status until NPU shuts down */
-			pr_err("waiting for shutdown status from fw\n");
-			if (wait_for_status_ready(npu_dev,
-				REG_NPU_FW_CTRL_STATUS,
-				FW_CTRL_STATUS_SHUTDOWN_DONE_VAL)) {
-				pr_err("wait for fw shutdown timedout\n");
-				ret = -ETIMEDOUT;
+void disable_fw(struct npu_device *npu_dev)
+{
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+
+	mutex_lock(&host_ctx->lock);
+	disable_fw_nolock(npu_dev);
+	mutex_unlock(&host_ctx->lock);
+}
+
+/* notify fw current power level */
+static int npu_notify_fw_pwr_state(struct npu_device *npu_dev,
+	uint32_t pwr_level, bool post)
+{
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+	struct ipc_cmd_notify_pwr_pkt pwr_notify_pkt;
+	int ret = 0;
+	uint32_t reg_val;
+
+	/* Clear PWR_NOTIFY bits before sending cmd */
+	reg_val = REGR(npu_dev, REG_NPU_FW_CTRL_STATUS);
+	reg_val &=  ~(FW_CTRL_STATUS_PWR_NOTIFY_ERR_VAL|
+		FW_CTRL_STATUS_PWR_NOTIFY_DONE_VAL);
+	REGW(npu_dev, REG_NPU_FW_CTRL_STATUS, reg_val);
+	REGR(npu_dev, REG_NPU_FW_CTRL_STATUS);
+
+	if (pwr_level == NPU_PWRLEVEL_OFF)
+		NPU_DBG("Notify fw power off\n");
+	else
+		NPU_DBG("Notify fw power level %d [%s]", pwr_level,
+			post ? "post" : "pre");
+
+	/* send IPC command to FW */
+	pwr_notify_pkt.header.cmd_type = NPU_IPC_CMD_NOTIFY_PWR;
+	pwr_notify_pkt.header.size = sizeof(struct ipc_cmd_notify_pwr_pkt);
+	pwr_notify_pkt.header.trans_id =
+		atomic_add_return(1, &host_ctx->ipc_trans_id);
+	pwr_notify_pkt.header.flags = 0;
+	pwr_notify_pkt.pwr_level = pwr_level;
+	pwr_notify_pkt.notify_type = post ?
+		NPU_POWER_POST_NOTIFY : NPU_POWER_PRE_NOTIFY;
+
+	ret = npu_send_misc_cmd(npu_dev, IPC_QUEUE_CMD_HIGH_PRIORITY,
+		&pwr_notify_pkt);
+
+	if (ret) {
+		NPU_ERR("NPU_IPC_CMD_NOTIFY_PWR sent failed: %d\n", ret);
+	} else {
+		ret = wait_for_status_ready(npu_dev, REG_NPU_FW_CTRL_STATUS,
+			FW_CTRL_STATUS_PWR_NOTIFY_DONE_VAL, true);
+		if (!ret) {
+			reg_val = REGR(npu_dev, REG_NPU_FW_CTRL_STATUS);
+			if (reg_val & FW_CTRL_STATUS_PWR_NOTIFY_ERR_VAL) {
+				NPU_ERR("NOTIfY_PWR failed\n");
+				ret = -EPERM;
 			}
 		}
+
+		/* allow to send another misc cmd if timedout */
+		host_ctx->misc_cmd_pending = false;
 	}
 
-	npu_disable_post_pil_clocks(npu_dev);
-	npu_disable_sys_cache(npu_dev);
-	subsystem_put_local(host_ctx->subsystem_handle);
-	host_ctx->fw_state = FW_DISABLED;
+	return ret;
+}
 
-	/*
-	 * if fw is still alive, notify dsp before power off
-	 * otherwise delay 500 ms to make sure dsp has finished
-	 * its own ssr handling.
-	 */
-	if (fw_alive)
-		npu_notify_dsp(npu_dev, false);
-	else
-		msleep(500);
+int npu_host_notify_fw_pwr_state(struct npu_device *npu_dev,
+	uint32_t pwr_level, bool post)
+{
+	return npu_notify_fw_pwr_state(npu_dev, pwr_level, post);
+}
 
-	npu_disable_core_power(npu_dev);
+static int npu_notifier_cb(struct notifier_block *this, unsigned long code,
+	void *data)
+{
+	int ret = 0;
+	struct npu_host_ctx *host_ctx =
+		container_of(this, struct npu_host_ctx, nb);
+	struct npu_device *npu_dev = host_ctx->npu_dev;
+	uint32_t reg_val;
 
-	if (ssr) {
-		/* mark all existing network to error state */
-		for (i = 0; i < MAX_LOADED_NETWORK; i++) {
-			network = &host_ctx->networks[i];
-			if (network->is_valid)
-				network->fw_error = true;
+	NPU_DBG("notifier code %d\n", code);
+	switch (code) {
+	case SUBSYS_BEFORE_POWERUP:
+	{
+		/*
+		 * Prepare for loading fw via pil
+		 * It will be called during initial load fw
+		 * or subsyste restart
+		 */
+		npu_notify_aop(npu_dev, true);
+		ret = npu_enable_core_power(npu_dev);
+		if (ret) {
+			NPU_WARN("Enable core power failed\n");
+			break;
 		}
+
+		ret = npu_enable_sys_cache(npu_dev);
+		if (ret) {
+			NPU_WARN("Enable sys cache failed\n");
+			break;
+		}
+
+		npu_cc_reg_write(npu_dev, NPU_CC_NPU_CPC_RSC_CTRL, 3);
+
+		/* Clear control/status registers */
+		REGW(npu_dev, REG_NPU_FW_CTRL_STATUS, 0x0);
+		REGW(npu_dev, REG_NPU_HOST_CTRL_VALUE, 0x0);
+		REGW(npu_dev, REG_FW_TO_HOST_EVENT, 0x0);
+
+		NPU_DBG("fw_dbg_mode %x\n", host_ctx->fw_dbg_mode);
+		reg_val = 0;
+		if (host_ctx->fw_dbg_mode & FW_DBG_MODE_PAUSE)
+			reg_val |= HOST_CTRL_STATUS_FW_PAUSE_VAL;
+
+		if (host_ctx->fw_dbg_mode & FW_DBG_DISABLE_WDOG)
+			reg_val |= HOST_CTRL_STATUS_DISABLE_WDOG_VAL;
+
+		if (npu_hw_clk_gating_enabled())
+			reg_val |= HOST_CTRL_STATUS_BOOT_ENABLE_CLK_GATE_VAL;
+
+		REGW(npu_dev, REG_NPU_HOST_CTRL_STATUS, reg_val);
+		/* Read back to flush all registers for fw to read */
+		REGR(npu_dev, REG_NPU_HOST_CTRL_STATUS);
+
+		/* Initialize the host side IPC before fw boots up */
+		npu_host_ipc_pre_init(npu_dev);
+		complete(&host_ctx->npu_power_up_done);
+		break;
+	}
+	case SUBSYS_AFTER_POWERUP:
+		break;
+	case SUBSYS_BEFORE_SHUTDOWN:
+	{
+		/* Prepare for unloading fw via PIL */
+		if (host_ctx->fw_state == FW_ENABLED) {
+			/* only happens during subsystem_restart */
+			host_ctx->fw_state = FW_UNLOADED;
+			npu_disable_irq(npu_dev);
+			npu_disable_sys_cache(npu_dev);
+			npu_disable_core_power(npu_dev);
+			npu_notify_aop(npu_dev, false);
+		}
+
+		/* vote minimum bandwidth before unload npu fw via PIL */
+		ret = npu_set_bw(npu_dev, 100, 100);
+		if (ret)
+			NPU_WARN("Can't update bandwidth\n");
+
+		break;
+	}
+	case SUBSYS_AFTER_SHUTDOWN:
+		ret = npu_set_bw(npu_dev, 0, 0);
+		if (ret)
+			NPU_WARN("Can't update bandwidth\n");
+		break;
+	default:
+		NPU_DBG("Ignoring event\n");
+		break;
 	}
 
-	complete(&host_ctx->fw_deinit_done);
+	return ret;
+}
+
+static void npu_update_pwr_work(struct work_struct *work)
+{
+	int ret;
+	struct npu_host_ctx *host_ctx;
+	struct npu_device *npu_dev;
+
+	host_ctx = container_of(work, struct npu_host_ctx, update_pwr_work);
+	npu_dev = container_of(host_ctx, struct npu_device, host_ctx);
+
+	mutex_lock(&host_ctx->lock);
+	ret = npu_set_power_level(npu_dev, true);
 	mutex_unlock(&host_ctx->lock);
-	pr_err("firmware deinit complete\n");
-	npu_notify_aop(npu_dev, false);
+
+	if (ret)
+		NPU_ERR("Update power level failed %d\n", ret);
+}
+
+int npu_host_update_power(struct npu_device *npu_dev)
+{
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+
+	if (host_ctx->wq)
+		queue_work(host_ctx->wq, &host_ctx->update_pwr_work);
+
+	return 0;
 }
 
 int npu_host_init(struct npu_device *npu_dev)
 {
+	int sts = 0;
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 
 	memset(host_ctx, 0, sizeof(*host_ctx));
-	init_completion(&host_ctx->loopback_done);
+	init_completion(&host_ctx->misc_cmd_done);
 	init_completion(&host_ctx->fw_deinit_done);
-	init_completion(&host_ctx->property_done);
+	init_completion(&host_ctx->fw_bringup_done);
+	init_completion(&host_ctx->fw_shutdown_done);
+	init_completion(&host_ctx->npu_power_up_done);
 	mutex_init(&host_ctx->lock);
+	spin_lock_init(&host_ctx->bridge_mbox_lock);
 	atomic_set(&host_ctx->ipc_trans_id, 1);
-	host_ctx->npu_dev = npu_dev;
 
-	host_ctx->wq = npu_create_wq(host_ctx, "npu_wq");
-	if (!host_ctx->wq)
-		return -EPERM;
+	host_ctx->npu_dev = npu_dev;
+	host_ctx->nb.notifier_call = npu_notifier_cb;
+	host_ctx->notif_hdle = subsys_notif_register_notifier("npu",
+		&host_ctx->nb);
+	if (IS_ERR(host_ctx->notif_hdle)) {
+		NPU_ERR("register event notification failed\n");
+		sts = PTR_ERR(host_ctx->notif_hdle);
+		host_ctx->notif_hdle = NULL;
+		goto fail;
+	}
+
+	host_ctx->wq = create_workqueue("npu_general_wq");
+	host_ctx->wq_pri =
+		alloc_workqueue("npu_ipc_wq", WQ_HIGHPRI | WQ_UNBOUND, 0);
+	if (!host_ctx->wq || !host_ctx->wq_pri) {
+		sts = -EPERM;
+		goto fail;
+	} else {
+		INIT_WORK(&host_ctx->ipc_irq_work, npu_ipc_irq_work);
+		INIT_WORK(&host_ctx->wdg_err_irq_work, npu_wdg_err_irq_work);
+		INIT_WORK(&host_ctx->bridge_mbox_work, npu_bridge_mbox_work);
+		INIT_WORK(&host_ctx->load_fw_work, npu_load_fw_work);
+		INIT_WORK(&host_ctx->update_pwr_work, npu_update_pwr_work);
+		INIT_DELAYED_WORK(&host_ctx->disable_fw_work,
+			npu_disable_fw_work);
+	}
+
+	host_ctx->ipc_msg_buf = kzalloc(NPU_IPC_BUF_LENGTH, GFP_KERNEL);
+	if (!host_ctx->ipc_msg_buf) {
+		NPU_ERR("Failed to allocate ipc buffer\n");
+		sts = -ENOMEM;
+		goto fail;
+	}
 
 	host_ctx->prop_buf = kzalloc(sizeof(struct msm_npu_property),
 		GFP_KERNEL);
-	if (!host_ctx->prop_buf)
-		return -ENOMEM;
+	if (!host_ctx->prop_buf) {
+		sts = -ENOMEM;
+		goto fail;
+	}
 
-	return 0;
+	host_ctx->auto_pil_disable = false;
+
+	return sts;
+fail:
+	kfree(host_ctx->ipc_msg_buf);
+	if (host_ctx->wq)
+		destroy_workqueue(host_ctx->wq);
+	if (host_ctx->wq_pri)
+		destroy_workqueue(host_ctx->wq_pri);
+	if (host_ctx->notif_hdle)
+		subsys_notif_unregister_notifier(host_ctx->notif_hdle,
+			&host_ctx->nb);
+	mutex_destroy(&host_ctx->lock);
+	return sts;
 }
 
 void npu_host_deinit(struct npu_device *npu_dev)
@@ -324,18 +681,18 @@ void npu_host_deinit(struct npu_device *npu_dev)
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 
 	kfree(host_ctx->prop_buf);
-	npu_destroy_wq(host_ctx);
+	kfree(host_ctx->ipc_msg_buf);
+	destroy_workqueue(host_ctx->wq);
+	destroy_workqueue(host_ctx->wq_pri);
+	subsys_notif_unregister_notifier(host_ctx->notif_hdle, &host_ctx->nb);
 	mutex_destroy(&host_ctx->lock);
 }
 
-/* -------------------------------------------------------------------------
+/*
  * Function Definitions - Interrupt Handler
- * -------------------------------------------------------------------------
  */
-irqreturn_t npu_intr_hdler(int irq, void *ptr)
+irqreturn_t npu_ipc_intr_hdlr(int irq, void *ptr)
 {
-	/* Check the interrupt we received */
-	/* Currently this is the IPC interrupt */
 	struct npu_device *npu_dev = (struct npu_device *)ptr;
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 
@@ -343,106 +700,289 @@ irqreturn_t npu_intr_hdler(int irq, void *ptr)
 
 	/* Check that the event thread currently is running */
 	if (host_ctx->wq)
-		queue_work(host_ctx->wq, &host_ctx->irq_work);
+		queue_work(host_ctx->wq_pri, &host_ctx->ipc_irq_work);
 
 	return IRQ_HANDLED;
 }
 
-/* -------------------------------------------------------------------------
+irqreturn_t npu_general_intr_hdlr(int irq, void *ptr)
+{
+	uint32_t reg_val, ack_val;
+	struct npu_device *npu_dev = (struct npu_device *)ptr;
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+
+	reg_val = npu_cc_reg_read(npu_dev,
+		NPU_CC_NPU_MASTERn_GENERAL_IRQ_STATUS(0));
+	NPU_DBG("GENERAL_IRQ_STATUS %x\n", reg_val);
+	reg_val &= (RSC_SHUTDOWN_REQ_IRQ_STATUS | RSC_BRINGUP_REQ_IRQ_STATUS);
+	ack_val = npu_cc_reg_read(npu_dev, NPU_CC_NPU_CPC_RSC_CTRL);
+
+	if (reg_val & RSC_SHUTDOWN_REQ_IRQ_STATUS)
+		ack_val |= Q6SS_RSC_SHUTDOWN_ACK_EN;
+
+	if (reg_val & RSC_BRINGUP_REQ_IRQ_STATUS)
+		ack_val |= Q6SS_RSC_BRINGUP_ACK_EN;
+
+	npu_cc_reg_write(npu_dev, NPU_CC_NPU_CPC_RSC_CTRL, ack_val);
+	npu_cc_reg_write(npu_dev,
+		NPU_CC_NPU_MASTERn_GENERAL_IRQ_CLEAR(0), reg_val);
+
+	if (reg_val & RSC_SHUTDOWN_REQ_IRQ_STATUS)
+		complete(&host_ctx->fw_shutdown_done);
+
+	if (reg_val & RSC_BRINGUP_REQ_IRQ_STATUS)
+		complete(&host_ctx->fw_bringup_done);
+
+	return IRQ_HANDLED;
+}
+
+irqreturn_t npu_err_intr_hdlr(int irq, void *ptr)
+{
+	struct npu_device *npu_dev = (struct npu_device *)ptr;
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+
+	host_ctx->err_irq_sts = npu_cc_reg_read(npu_dev,
+		NPU_CC_NPU_MASTERn_ERROR_IRQ_STATUS(0));
+	npu_cc_reg_write(npu_dev,
+		NPU_CC_NPU_MASTERn_ERROR_IRQ_CLEAR(0),
+		host_ctx->err_irq_sts);
+	NPU_ERR("err_irq_sts %x\n", host_ctx->err_irq_sts);
+
+	if (host_ctx->wq)
+		queue_work(host_ctx->wq_pri, &host_ctx->wdg_err_irq_work);
+
+	return IRQ_HANDLED;
+}
+
+irqreturn_t npu_wdg_intr_hdlr(int irq, void *ptr)
+{
+	struct npu_device *npu_dev = (struct npu_device *)ptr;
+	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
+
+	host_ctx->wdg_irq_sts = npu_cc_reg_read(npu_dev,
+		NPU_CC_NPU_MASTERn_WDOG_BITE_IRQ_STATUS(0));
+	NPU_ERR("wdg_irq_sts %x\n", host_ctx->wdg_irq_sts);
+
+	if (host_ctx->wq)
+		queue_work(host_ctx->wq_pri, &host_ctx->wdg_err_irq_work);
+
+	return IRQ_HANDLED;
+}
+
+/*
  * Function Definitions - Control
- * -------------------------------------------------------------------------
  */
 static int host_error_hdlr(struct npu_device *npu_dev, bool force)
 {
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 	struct npu_network *network = NULL;
 	struct npu_kevent kevt;
-	int i;
+	bool fw_alive = true;
+	int i, ret = 0;
+
+	mutex_lock(&host_ctx->lock);
 
 	if ((host_ctx->wdg_irq_sts == 0) && (host_ctx->err_irq_sts == 0)
-		&& !force)
+		&& !force) {
+		mutex_unlock(&host_ctx->lock);
 		return 0;
+	}
 
-	if (host_ctx->wdg_irq_sts)
-		pr_info("watchdog irq triggered\n");
+	if (host_ctx->wdg_irq_sts) {
+		NPU_INFO("watchdog irq triggered\n");
+		npu_dump_debug_info(npu_dev);
+		fw_alive = false;
+	}
 
-	fw_deinit(npu_dev, true, force);
+	/*
+	 * if fw is still alive, notify fw before power off
+	 * otherwise if ssr happens or notify fw returns failure
+	 * delay 500 ms to make sure dsp has finished
+	 * its own ssr handling.
+	 */
+	if (fw_alive) {
+		if (npu_notify_fw_pwr_state(npu_dev, NPU_PWRLEVEL_OFF, false)) {
+			NPU_WARN("notify fw pwr off failed\n");
+			msleep(500);
+		}
+	} else {
+		msleep(500);
+	}
+
+	NPU_INFO("npu subsystem is restarting\n");
+	reinit_completion(&host_ctx->npu_power_up_done);
+	ret = subsystem_restart_dev(host_ctx->subsystem_handle);
+	if (ret) {
+		NPU_ERR("npu subsystem restart failed\n");
+		host_ctx->fw_state = FW_UNLOADED;
+		goto fw_start_done;
+	}
+	NPU_INFO("npu subsystem is restarted\n");
+
+	ret = wait_for_completion_timeout(
+		&host_ctx->npu_power_up_done, NW_CMD_TIMEOUT);
+	if (!ret) {
+		NPU_ERR("Wait for npu powers up timed out\n");
+		ret = -ETIMEDOUT;
+		goto fw_start_done;
+	}
+
+	/* Keep reading ctrl status until NPU is ready */
+	if (wait_for_status_ready(npu_dev, REG_NPU_FW_CTRL_STATUS,
+		FW_CTRL_STATUS_MAIN_THREAD_READY_VAL, false)) {
+		NPU_ERR("wait for fw status ready timedout\n");
+		ret = -EPERM;
+		goto fw_start_done;
+	}
+
+	npu_host_ipc_post_init(npu_dev);
+	NPU_DBG("firmware init complete\n");
+
+	host_ctx->fw_state = FW_ENABLED;
+
+	ret = npu_enable_irq(npu_dev);
+	if (ret)
+		NPU_ERR("Enable irq failed\n");
+
+fw_start_done:
+	/* mark all existing network to error state */
+	for (i = 0; i < MAX_LOADED_NETWORK; i++) {
+		network = &host_ctx->networks[i];
+		if (network->is_valid)
+			network->fw_error = true;
+	}
+
+	complete(&host_ctx->fw_deinit_done);
 	host_ctx->wdg_irq_sts = 0;
 	host_ctx->err_irq_sts = 0;
 
 	/* flush all pending npu cmds */
-	mutex_lock(&host_ctx->lock);
 	for (i = 0; i < MAX_LOADED_NETWORK; i++) {
 		network = &host_ctx->networks[i];
 		if (network->is_valid && network->cmd_pending &&
 			network->fw_error) {
 			if (network->cmd_async) {
-				pr_debug("async cmd, queue ssr event\n");
+				NPU_DBG("async cmd, queue ssr event\n");
 				kevt.evt.type = MSM_NPU_EVENT_TYPE_SSR;
 				kevt.evt.u.ssr.network_hdl =
 					network->network_hdl;
 				if (npu_queue_event(network->client, &kevt))
-					pr_err("queue npu event failed\n");
+					NPU_ERR("queue npu event failed\n");
 			} else {
-				pr_debug("complete network %llx\n",
+				NPU_DBG("complete network %llx\n",
 					network->id);
 				complete(&network->cmd_done);
 			}
 		}
 	}
-	complete_all(&host_ctx->loopback_done);
+	complete_all(&host_ctx->misc_cmd_done);
 	mutex_unlock(&host_ctx->lock);
 
-	return 1;
+	return ret;
 }
 
-static void host_irq_wq(struct work_struct *work)
+static void npu_ipc_irq_work(struct work_struct *work)
 {
 	struct npu_host_ctx *host_ctx;
 	struct npu_device *npu_dev;
 
-	host_ctx = container_of(work, struct npu_host_ctx, irq_work);
+	host_ctx = container_of(work, struct npu_host_ctx, ipc_irq_work);
 	npu_dev = container_of(host_ctx, struct npu_device, host_ctx);
-
-	if (host_error_hdlr(npu_dev, false))
-		return;
 
 	host_session_log_hdlr(npu_dev);
 	host_session_msg_hdlr(npu_dev);
 }
 
-static void fw_deinit_wq(struct work_struct *work)
+static void npu_wdg_err_irq_work(struct work_struct *work)
 {
 	struct npu_host_ctx *host_ctx;
 	struct npu_device *npu_dev;
 
-	pr_err("%s: deinit fw\n", __func__);
-	host_ctx = container_of(work, struct npu_host_ctx, fw_deinit_work.work);
+	host_ctx = container_of(work, struct npu_host_ctx, wdg_err_irq_work);
 	npu_dev = container_of(host_ctx, struct npu_device, host_ctx);
 
-	if (atomic_read(&host_ctx->fw_deinit_work_cnt) == 0)
+	host_error_hdlr(npu_dev, false);
+}
+
+static void npu_disable_fw_work(struct work_struct *work)
+{
+	struct npu_host_ctx *host_ctx;
+	struct npu_device *npu_dev;
+
+	NPU_DBG("Enter disable fw work\n");
+	host_ctx = container_of(work, struct npu_host_ctx,
+		disable_fw_work.work);
+	npu_dev = container_of(host_ctx, struct npu_device, host_ctx);
+
+	mutex_lock(&host_ctx->lock);
+	if (host_ctx->bridge_mbox_pwr_on) {
+		disable_fw_nolock(npu_dev);
+		host_ctx->bridge_mbox_pwr_on = false;
+	}
+	mutex_unlock(&host_ctx->lock);
+	NPU_DBG("Exit disable fw work\n");
+}
+
+static int npu_bridge_mbox_send_data(struct npu_host_ctx *host_ctx,
+	struct npu_mbox *mbox, void *data)
+{
+	NPU_DBG("Generating IRQ for client_id: %u; signal_id: %u\n",
+		mbox->client_id, mbox->signal_id);
+	mbox_send_message(mbox->chan, NULL);
+	mbox_client_txdone(mbox->chan, 0);
+	mbox->send_data_pending = false;
+
+	return 0;
+}
+
+static void npu_bridge_mbox_work(struct work_struct *work)
+{
+	int i, ret;
+	struct npu_host_ctx *host_ctx;
+	struct npu_device *npu_dev;
+	unsigned long flags;
+
+	NPU_DBG("Enter bridge mbox work\n");
+	host_ctx = container_of(work, struct npu_host_ctx, bridge_mbox_work);
+	npu_dev = container_of(host_ctx, struct npu_device, host_ctx);
+
+	mutex_lock(&host_ctx->lock);
+	if (host_ctx->fw_state == FW_UNLOADED) {
+		NPU_WARN("NPU fw is not loaded\n");
+		mutex_unlock(&host_ctx->lock);
 		return;
+	}
 
-	do {
-        	fw_deinit(npu_dev, false, true);
-	} while (!atomic_dec_and_test(&host_ctx->fw_deinit_work_cnt));
-}
+	if ((host_ctx->wdg_irq_sts != 0) || (host_ctx->err_irq_sts != 0)) {
+		NPU_WARN("SSR is triggered, skip this time\n");
+		mutex_unlock(&host_ctx->lock);
+		return;
+	}
 
-static void npu_destroy_wq(struct npu_host_ctx *host_ctx)
-{
-	flush_delayed_work(&host_ctx->fw_deinit_work);
-	destroy_workqueue(host_ctx->wq);
-}
+	/* queue or modify delayed work to disable fw */
+	mod_delayed_work(host_ctx->wq, &host_ctx->disable_fw_work,
+		NPU_MBOX_IDLE_TIMEOUT);
 
-static struct workqueue_struct *npu_create_wq(struct npu_host_ctx *host_ctx,
-	const char *name)
-{
-	struct workqueue_struct *wq = create_workqueue(name);
+	if (!host_ctx->bridge_mbox_pwr_on) {
+		ret = enable_fw_nolock(npu_dev);
+		if (ret) {
+			mutex_unlock(&host_ctx->lock);
+			NPU_ERR("Enable fw failed\n");
+			return;
+		}
+		host_ctx->bridge_mbox_pwr_on = true;
+		NPU_DBG("Fw is enabled by mbox\n");
+	}
 
-	INIT_WORK(&host_ctx->irq_work, host_irq_wq);
-	INIT_DELAYED_WORK(&host_ctx->fw_deinit_work, fw_deinit_wq);
+	spin_lock_irqsave(&host_ctx->bridge_mbox_lock, flags);
+	for (i = 0; i < NPU_MAX_MBOX_NUM; i++)
+		if (npu_dev->mbox[i].send_data_pending)
+			npu_bridge_mbox_send_data(host_ctx,
+				&npu_dev->mbox[i], NULL);
 
-	return wq;
+	spin_unlock_irqrestore(&host_ctx->bridge_mbox_lock, flags);
+	mutex_unlock(&host_ctx->lock);
+	NPU_DBG("Exit bridge mbox work\n");
 }
 
 static void turn_off_fw_logging(struct npu_device *npu_dev)
@@ -451,6 +991,7 @@ static void turn_off_fw_logging(struct npu_device *npu_dev)
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 	int ret = 0;
 
+	mutex_lock(&host_ctx->lock);
 	log_packet.header.cmd_type = NPU_IPC_CMD_CONFIG_LOG;
 	log_packet.header.size = sizeof(struct ipc_cmd_log_state_pkt);
 	log_packet.header.trans_id =
@@ -461,14 +1002,18 @@ static void turn_off_fw_logging(struct npu_device *npu_dev)
 	ret = npu_send_misc_cmd(npu_dev, IPC_QUEUE_CMD_HIGH_PRIORITY,
 		&log_packet);
 
-	pr_debug("NPU_IPC_CMD_CONFIG_LOG sent status: %d\n", ret);
+	NPU_DBG("NPU_IPC_CMD_CONFIG_LOG sent status: %d\n", ret);
 
 	if (ret)
-		pr_err("npu_host_ipc_send_cmd failed\n");
+		NPU_ERR("npu_host_ipc_send_cmd failed\n");
+	else
+		host_ctx->misc_cmd_pending = false;
+
+	mutex_unlock(&host_ctx->lock);
 }
 
 static int wait_for_status_ready(struct npu_device *npu_dev,
-	uint32_t status_reg, uint32_t status_bits)
+	uint32_t status_reg, uint32_t status_bits, bool poll)
 {
 	uint32_t ctrl_sts = 0;
 	uint32_t wait_cnt = 0, max_wait_ms;
@@ -476,48 +1021,35 @@ static int wait_for_status_ready(struct npu_device *npu_dev,
 
 	max_wait_ms = (host_ctx->fw_dbg_mode & FW_DBG_MODE_INC_TIMEOUT) ?
 		NW_DEBUG_TIMEOUT_MS : NPU_FW_TIMEOUT_MS;
+	if (poll)
+		wait_cnt = max_wait_ms * 10;
+	else
+		wait_cnt = max_wait_ms / NPU_FW_TIMEOUT_POLL_INTERVAL_MS;
 
 	/* keep reading status register until bits are set */
-	while ((ctrl_sts & status_bits) != status_bits) {
+	do {
 		ctrl_sts = REGR(npu_dev, status_reg);
-		msleep(NPU_FW_TIMEOUT_POLL_INTERVAL_MS);
-		wait_cnt += NPU_FW_TIMEOUT_POLL_INTERVAL_MS;
-		if (wait_cnt >= max_wait_ms) {
-			pr_err("timeout wait for status %x[%x] in reg %x\n",
+		if ((ctrl_sts & status_bits) == status_bits) {
+			NPU_DBG("status %x[reg %x] ready received\n",
+				status_bits, status_reg);
+			break;
+		}
+
+		if (!wait_cnt) {
+			NPU_ERR("timeout wait for status %x[%x] in reg %x\n",
 				status_bits, ctrl_sts, status_reg);
 			return -EPERM;
 		}
-	}
-	pr_err("status %x[reg %x] ready received\n", status_bits, status_reg);
+
+		if (poll)
+			udelay(100);
+		else
+			msleep(NPU_FW_TIMEOUT_POLL_INTERVAL_MS);
+
+		wait_cnt--;
+	} while (1);
+
 	return 0;
-}
-
-static int npu_notify_dsp(struct npu_device *npu_dev, bool pwr_up)
-{
-	uint32_t ack_val, notify_val;
-	int ret = 0;
-
-	if (pwr_up) {
-		notify_val = HOST_DSP_CTRL_STATUS_PWR_UP_VAL;
-		ack_val = HOST_DSP_CTRL_STATUS_PWR_UP_ACK_VAL;
-	} else {
-		notify_val = HOST_DSP_CTRL_STATUS_PWR_DWN_VAL;
-		ack_val = HOST_DSP_CTRL_STATUS_PWR_DWN_ACK_VAL;
-	}
-
-	REGW(npu_dev, REG_HOST_DSP_CTRL_STATUS,
-		notify_val);
-	/* Read back to flush register for dsp to read */
-	REGR(npu_dev, REG_HOST_DSP_CTRL_STATUS);
-
-	INTERRUPT_RAISE_DSP(npu_dev);
-
-	ret = wait_for_status_ready(npu_dev, REG_HOST_DSP_CTRL_STATUS,
-		ack_val);
-	if (ret)
-		pr_warn("No response from dsp\n");
-
-	return ret;
 }
 
 #define MAX_LEN 128
@@ -528,33 +1060,30 @@ static int npu_notify_aop(struct npu_device *npu_dev, bool on)
 	struct qmp_pkt pkt;
 	int buf_size, rc = 0;
 
-	if (!npu_dev->mbox_aop.chan) {
-		pr_warn("aop mailbox channel is not available\n");
+	if (!npu_dev->mbox_aop || !npu_dev->mbox_aop->chan)
 		return 0;
-	}
 
 	buf_size = scnprintf(buf, MAX_LEN, "{class: bcm, res: npu_on, val: %d}",
 		on ? 1 : 0);
 	if (buf_size < 0) {
-		pr_err("prepare qmp notify buf failed\n");
+		NPU_ERR("prepare qmp notify buf failed\n");
 		return -EINVAL;
 	}
 
-	pr_debug("send msg %s to aop\n", buf);
+	NPU_DBG("send msg %s to aop\n", buf);
 	memset(&pkt, 0, sizeof(pkt));
 	pkt.size = (buf_size + 3) & ~0x3;
 	pkt.data = buf;
 
-	rc = mbox_send_message(npu_dev->mbox_aop.chan, &pkt);
+	rc = mbox_send_message(npu_dev->mbox_aop->chan, &pkt);
 	if (rc < 0)
-		pr_err("qmp message send failed, ret=%d\n", rc);
+		NPU_ERR("qmp message send failed, ret=%d\n", rc);
 
 	return rc;
 }
 
-/* -------------------------------------------------------------------------
+/*
  * Function Definitions - Network Management
- * -------------------------------------------------------------------------
  */
 static int network_put(struct npu_network *network)
 {
@@ -588,7 +1117,7 @@ static struct npu_network *alloc_network(struct npu_host_ctx *ctx,
 	}
 
 	if (i == MAX_LOADED_NETWORK) {
-		pr_err("No free network\n");
+		NPU_ERR("No free network\n");
 		return NULL;
 	}
 
@@ -605,8 +1134,6 @@ static struct npu_network *alloc_network(struct npu_host_ctx *ctx,
 	}
 
 	ctx->network_num++;
-	pr_err("%s:Active network num %d\n", __func__, ctx->network_num);
-
 	return network;
 }
 
@@ -626,12 +1153,12 @@ static struct npu_network *get_network_by_hdl(struct npu_host_ctx *ctx,
 	}
 
 	if ((i == MAX_LOADED_NETWORK) || !network->is_valid) {
-		pr_err("network hdl invalid %d\n", hdl);
+		NPU_ERR("network hdl invalid %d\n", hdl);
 		return NULL;
 	}
 
 	if (client && (client != network->client)) {
-		pr_err("network %lld doesn't belong to this client\n",
+		NPU_ERR("network %lld doesn't belong to this client\n",
 			network->id);
 		return NULL;
 	}
@@ -649,13 +1176,13 @@ static struct npu_network *get_network_by_id(struct npu_host_ctx *ctx,
 
 	if (id < 1 || id > MAX_LOADED_NETWORK ||
 		!ctx->networks[id - 1].is_valid) {
-		pr_err("Invalid network id %d\n", (int32_t)id);
+		NPU_ERR("Invalid network id %d\n", (int32_t)id);
 		return NULL;
 	}
 
 	network = &ctx->networks[id - 1];
 	if (client && (client != network->client)) {
-		pr_err("network %lld doesn't belong to this client\n", id);
+		NPU_ERR("network %lld doesn't belong to this client\n", id);
 		return NULL;
 	}
 
@@ -677,18 +1204,15 @@ static void free_network(struct npu_host_ctx *ctx, struct npu_client *client,
 			kfree(network->stats_buf);
 			memset(network, 0, sizeof(struct npu_network));
 			ctx->network_num--;
-			pr_err("%s:Active network num %d\n", __func__,
-				ctx->network_num);
 		} else {
-			pr_warn("network %lld:%d is in use\n", network->id,
+			NPU_WARN("network %lld:%d is in use\n", network->id,
 				atomic_read(&network->ref_cnt));
 		}
 	}
 }
 
-/* -------------------------------------------------------------------------
+/*
  * Function Definitions - IPC
- * -------------------------------------------------------------------------
  */
 static int npu_queue_event(struct npu_client *client, struct npu_kevent *evt)
 {
@@ -721,30 +1245,27 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 		struct ipc_msg_execute_pkt *exe_rsp_pkt =
 			(struct ipc_msg_execute_pkt *)msg;
 
-		pr_err("NPU_IPC_MSG_EXECUTE_DONE status: %d\n",
+		NPU_DBG("NPU_IPC_MSG_EXECUTE_DONE status: %d\n",
 			exe_rsp_pkt->header.status);
-		pr_err("trans_id : %d", exe_rsp_pkt->header.trans_id);
-		pr_err("e2e_IPC_time: %d (in tick count)\n",
-			exe_rsp_pkt->stats.e2e_ipc_tick_count);
-		pr_err("aco_load_time: %d (in tick count)\n",
-			exe_rsp_pkt->stats.aco_load_tick_count);
-		pr_err("aco_execute_time: %d (in tick count)\n",
-			exe_rsp_pkt->stats.aco_execution_tick_count);
-		pr_err("total_num_layers: %d\n",
-			exe_rsp_pkt->stats.exe_stats.total_num_layers);
+		NPU_DBG("trans_id : %d\n", exe_rsp_pkt->header.trans_id);
 
 		network = get_network_by_hdl(host_ctx, NULL,
 			exe_rsp_pkt->network_hdl);
 		if (!network) {
-			pr_err("can't find network %x\n",
+			NPU_ERR("can't find network %x\n",
 				exe_rsp_pkt->network_hdl);
 			break;
 		}
 
 		if (network->trans_id != exe_rsp_pkt->header.trans_id) {
-			pr_err("execute_pkt trans_id is not match %d:%d\n",
+			NPU_ERR("execute_pkt trans_id is not match %d:%d\n",
 				network->trans_id,
 				exe_rsp_pkt->header.trans_id);
+			NPU_ERR("execute_pkt network hdl check %d:%d\n",
+				network->network_hdl,
+				exe_rsp_pkt->network_hdl);
+			NPU_ERR("execute_pkt network_id check %x\n",
+				network->id);
 			network_put(network);
 			break;
 		}
@@ -755,14 +1276,14 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 		if (!network->cmd_async) {
 			complete(&network->cmd_done);
 		} else {
-			pr_debug("async cmd, queue event\n");
+			NPU_DBG("async cmd, queue event\n");
 			kevt.evt.type = MSM_NPU_EVENT_TYPE_EXEC_DONE;
 			kevt.evt.u.exec_done.network_hdl =
 				exe_rsp_pkt->network_hdl;
 			kevt.evt.u.exec_done.exec_result =
 				exe_rsp_pkt->header.status;
 			if (npu_queue_event(network->client, &kevt))
-				pr_err("queue npu event failed\n");
+				NPU_ERR("queue npu event failed\n");
 		}
 		network_put(network);
 
@@ -774,29 +1295,34 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 			(struct ipc_msg_execute_pkt_v2 *)msg;
 		uint32_t stats_size = 0;
 
-		pr_err("NPU_IPC_MSG_EXECUTE_V2_DONE status: %d\n",
+		NPU_DBG("NPU_IPC_MSG_EXECUTE_V2_DONE status: %d\n",
 			exe_rsp_pkt->header.status);
-		pr_err("trans_id : %d", exe_rsp_pkt->header.trans_id);
+		NPU_DBG("trans_id : %d\n", exe_rsp_pkt->header.trans_id);
 
 		network = get_network_by_hdl(host_ctx, NULL,
 			exe_rsp_pkt->network_hdl);
 		if (!network) {
-			pr_err("can't find network %x\n",
+			NPU_ERR("can't find network %x\n",
 				exe_rsp_pkt->network_hdl);
 			break;
 		}
 
 		if (network->trans_id != exe_rsp_pkt->header.trans_id) {
-			pr_err("execute_pkt_v2 trans_id is not match %d:%d\n",
+			NPU_ERR("execute_pkt_v2 trans_id is not match %d:%d\n",
 				network->trans_id,
 				exe_rsp_pkt->header.trans_id);
+			NPU_ERR("execute_pkt_v2 network hdl check %d:%d\n",
+				network->network_hdl,
+				exe_rsp_pkt->network_hdl);
+			NPU_ERR("execute_pkt_v2 network id check %x\n",
+				network->id);
 			network_put(network);
 			break;
 		}
 
-		pr_err("network id : %d", network->id);
+		NPU_DBG("network id : %lld\n", network->id);
 		stats_size = exe_rsp_pkt->header.size - sizeof(*exe_rsp_pkt);
-		pr_err("stats_size %d:%d\n", exe_rsp_pkt->header.size,
+		NPU_DBG("stats_size %d:%d\n", exe_rsp_pkt->header.size,
 			stats_size);
 		stats_size = stats_size < network->stats_buf_size ?
 			stats_size : network->stats_buf_size;
@@ -809,7 +1335,7 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 		network->cmd_ret_status = exe_rsp_pkt->header.status;
 
 		if (network->cmd_async) {
-			pr_debug("async cmd, queue event\n");
+			NPU_DBG("async cmd, queue event\n");
 			kevt.evt.type = MSM_NPU_EVENT_TYPE_EXEC_V2_DONE;
 			kevt.evt.u.exec_v2_done.network_hdl =
 				exe_rsp_pkt->network_hdl;
@@ -817,9 +1343,10 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 				exe_rsp_pkt->header.status;
 			kevt.evt.u.exec_v2_done.stats_buf_size = stats_size;
 			kevt.reserved[0] = (uint64_t)network->stats_buf;
-			kevt.reserved[1] = (uint64_t)network->stats_buf_u;
+			kevt.reserved[1] =
+				(uint64_t __user)network->stats_buf_u;
 			if (npu_queue_event(network->client, &kevt))
-				pr_err("queue npu event failed\n");
+				NPU_ERR("queue npu event failed\n");
 		} else {
 			complete(&network->cmd_done);
 		}
@@ -832,31 +1359,24 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 		struct ipc_msg_load_pkt *load_rsp_pkt =
 			(struct ipc_msg_load_pkt *)msg;
 
-		pr_err("NPU_IPC_MSG_LOAD_DONE status: %d, trans_id: %d\n",
+		NPU_DBG("NPU_IPC_MSG_LOAD_DONE status: %d, trans_id: %d\n",
 			load_rsp_pkt->header.status,
 			load_rsp_pkt->header.trans_id);
-
-		/*
-		 * The upper 8 bits in flags is the current active
-		 * network count in fw
-		 */
-		pr_err("Current active network count in FW is %d\n",
-			load_rsp_pkt->header.flags >> 24);
 
 		/*
 		 * the upper 16 bits in returned network_hdl is
 		 * the network ID
 		 */
-		pr_err("network_hdl: %x\n", load_rsp_pkt->network_hdl);
+		NPU_DBG("network_hdl: %x\n", load_rsp_pkt->network_hdl);
 		network_id = load_rsp_pkt->network_hdl >> 16;
 		network = get_network_by_id(host_ctx, NULL, network_id);
 		if (!network) {
-			pr_err("can't find network %d\n", network_id);
+			NPU_ERR("can't find network %d\n", network_id);
 			break;
 		}
 
 		if (network->trans_id != load_rsp_pkt->header.trans_id) {
-			pr_err("load_rsp_pkt trans_id is not match %d:%d\n",
+			NPU_ERR("load_rsp_pkt trans_id is not match %d:%d\n",
 				network->trans_id,
 				load_rsp_pkt->header.trans_id);
 			network_put(network);
@@ -876,27 +1396,20 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 		struct ipc_msg_unload_pkt *unload_rsp_pkt =
 			(struct ipc_msg_unload_pkt *)msg;
 
-		pr_err("NPU_IPC_MSG_UNLOAD_DONE status: %d, trans_id: %d\n",
+		NPU_DBG("NPU_IPC_MSG_UNLOAD_DONE status: %d, trans_id: %d\n",
 			unload_rsp_pkt->header.status,
 			unload_rsp_pkt->header.trans_id);
-
-		/*
-		 * The upper 8 bits in flags is the current active
-		 * network count in fw
-		 */
-		pr_err("Current active network count in FW is %d\n",
-			unload_rsp_pkt->header.flags >> 24);
 
 		network = get_network_by_hdl(host_ctx, NULL,
 			unload_rsp_pkt->network_hdl);
 		if (!network) {
-			pr_err("can't find network %x\n",
+			NPU_ERR("can't find network %x\n",
 				unload_rsp_pkt->network_hdl);
 			break;
 		}
 
 		if (network->trans_id != unload_rsp_pkt->header.trans_id) {
-			pr_err("unload_rsp_pkt trans_id is not match %d:%d\n",
+			NPU_ERR("unload_rsp_pkt trans_id is not match %d:%d\n",
 				network->trans_id,
 				unload_rsp_pkt->header.trans_id);
 			network_put(network);
@@ -915,9 +1428,11 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 		struct ipc_msg_loopback_pkt *lb_rsp_pkt =
 			(struct ipc_msg_loopback_pkt *)msg;
 
-		pr_debug("NPU_IPC_MSG_LOOPBACK_DONE loopbackParams: 0x%x\n",
+		NPU_DBG("NPU_IPC_MSG_LOOPBACK_DONE loopbackParams: 0x%x\n",
 			lb_rsp_pkt->loopbackParams);
-		complete_all(&host_ctx->loopback_done);
+		host_ctx->misc_cmd_result = lb_rsp_pkt->header.status;
+		host_ctx->misc_cmd_pending = false;
+		complete_all(&host_ctx->misc_cmd_done);
 		break;
 	}
 	case NPU_IPC_MSG_SET_PROPERTY_DONE:
@@ -926,14 +1441,15 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 			(struct ipc_msg_prop_pkt *)msg;
 		uint32_t *param = (uint32_t *)((uint8_t *)prop_rsp_pkt +
 			sizeof(struct ipc_msg_prop_pkt));
-		pr_debug("NPU_IPC_MSG_SET_PROPERTY_DONE %d:0x%x:%d\n",
+		NPU_DBG("NPU_IPC_MSG_SET_PROPERTY_DONE %d:0x%x:%d\n",
 			prop_rsp_pkt->network_hdl,
 			prop_rsp_pkt->prop_id,
 			param[0]);
 
-		host_ctx->cmd_ret_status = prop_rsp_pkt->header.status;
+		host_ctx->misc_cmd_result = prop_rsp_pkt->header.status;
+		host_ctx->misc_cmd_pending = false;
 
-		complete_all(&host_ctx->property_done);
+		complete_all(&host_ctx->misc_cmd_done);
 		break;
 	}
 	case NPU_IPC_MSG_GET_PROPERTY_DONE:
@@ -944,13 +1460,14 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 		uint32_t *prop_data = (uint32_t *)((uint8_t *)prop_rsp_pkt +
 			sizeof(struct ipc_msg_header_pkt));
 
-		pr_debug("NPU_IPC_MSG_GET_PROPERTY_DONE %d:0x%x:%d:%d\n",
+		NPU_DBG("NPU_IPC_MSG_GET_PROPERTY_DONE %d:0x%x:%d:%d\n",
 			prop_rsp_pkt->network_hdl,
 			prop_rsp_pkt->prop_id,
 			prop_rsp_pkt->num_params,
 			prop_rsp_pkt->prop_param[0]);
 
-		host_ctx->cmd_ret_status = prop_rsp_pkt->header.status;
+		host_ctx->misc_cmd_result = prop_rsp_pkt->header.status;
+		host_ctx->misc_cmd_pending = false;
 
 		if (prop_rsp_pkt->num_params > 0) {
 			/* Copy prop data to kernel buffer */
@@ -959,7 +1476,7 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 			memcpy(host_ctx->prop_buf, prop_data, prop_size);
 		}
 
-		complete_all(&host_ctx->property_done);
+		complete_all(&host_ctx->misc_cmd_done);
 		break;
 	}
 	case NPU_IPC_MSG_GENERAL_NOTIFY:
@@ -967,26 +1484,26 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 		struct ipc_msg_general_notify_pkt *notify_msg_pkt =
 			(struct ipc_msg_general_notify_pkt *)msg;
 
-		pr_debug("NPU_IPC_MSG_GENERAL_NOTIFY %d:0x%x:%d\n",
+		NPU_DBG("NPU_IPC_MSG_GENERAL_NOTIFY %d:0x%x:%d\n",
 			notify_msg_pkt->network_hdl,
 			notify_msg_pkt->notify_id,
 			notify_msg_pkt->notify_param[0]);
 
 		switch (notify_msg_pkt->notify_id) {
 		case NPU_NOTIFY_DCVS_MODE:
-			pr_debug("NPU_IPC_MSG_GENERAL_NOTIFY DCVS_MODE %d\n",
+			NPU_DBG("NPU_IPC_MSG_GENERAL_NOTIFY DCVS_MODE %d\n",
 				notify_msg_pkt->notify_param[0]);
 			update_dcvs_activity(npu_dev,
 				notify_msg_pkt->notify_param[0]);
 			break;
 		default:
-			pr_err("Nothing to do\n");
+			NPU_ERR("Nothing to do\n");
 			break;
 		}
 		break;
 	}
 	default:
-		pr_err("Not supported apps response received %d\n",
+		NPU_ERR("Not supported apps response received %d\n",
 			msg_id);
 		break;
 	}
@@ -994,27 +1511,22 @@ static void app_msg_proc(struct npu_host_ctx *host_ctx, uint32_t *msg)
 
 static void host_session_msg_hdlr(struct npu_device *npu_dev)
 {
-	uint32_t *msg;
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 
-	msg = kzalloc(sizeof(uint32_t) * NPU_IPC_BUF_LENGTH, GFP_KERNEL);
-	if (!msg)
-		return;
-
 	mutex_lock(&host_ctx->lock);
-	if (host_ctx->fw_state == FW_DISABLED) {
-		pr_warn("handle npu session msg when FW is disabled\n");
+	if (host_ctx->fw_state != FW_ENABLED) {
+		NPU_WARN("handle npu session msg when FW is disabled\n");
 		goto skip_read_msg;
 	}
 
-	while (npu_host_ipc_read_msg(npu_dev, IPC_QUEUE_APPS_RSP, msg) == 0) {
-		pr_debug("received from msg queue\n");
-		app_msg_proc(host_ctx, msg);
+	while (npu_host_ipc_read_msg(npu_dev, IPC_QUEUE_APPS_RSP,
+		host_ctx->ipc_msg_buf) == 0) {
+		NPU_DBG("received from msg queue\n");
+		app_msg_proc(host_ctx, host_ctx->ipc_msg_buf);
 	}
 
 skip_read_msg:
 	mutex_unlock(&host_ctx->lock);
-	kfree(msg);
 }
 
 static void log_msg_proc(struct npu_device *npu_dev, uint32_t *msg)
@@ -1033,40 +1545,33 @@ static void log_msg_proc(struct npu_device *npu_dev, uint32_t *msg)
 		npu_process_log_message(npu_dev, log_msg, size);
 		break;
 	default:
-		pr_err("unsupported log response received %d\n", msg_id);
+		NPU_ERR("unsupported log response received %d\n", msg_id);
 		break;
 	}
 }
 
 static void host_session_log_hdlr(struct npu_device *npu_dev)
 {
-	uint32_t *msg;
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 
-	msg = kzalloc(sizeof(uint32_t) * NPU_IPC_BUF_LENGTH, GFP_KERNEL);
-
-	if (!msg)
-		return;
-
 	mutex_lock(&host_ctx->lock);
-	if (host_ctx->fw_state == FW_DISABLED) {
-		pr_warn("handle npu session msg when FW is disabled\n");
+	if (host_ctx->fw_state != FW_ENABLED) {
+		NPU_WARN("handle npu session msg when FW is disabled\n");
 		goto skip_read_msg;
 	}
 
-	while (npu_host_ipc_read_msg(npu_dev, IPC_QUEUE_LOG, msg) == 0) {
-		pr_debug("received from log queue\n");
-		log_msg_proc(npu_dev, msg);
+	while (npu_host_ipc_read_msg(npu_dev, IPC_QUEUE_LOG,
+		host_ctx->ipc_msg_buf) == 0) {
+		NPU_DBG("received from log queue\n");
+		log_msg_proc(npu_dev, host_ctx->ipc_msg_buf);
 	}
 
 skip_read_msg:
 	mutex_unlock(&host_ctx->lock);
-	kfree(msg);
 }
 
-/* -------------------------------------------------------------------------
+/*
  * Function Definitions - Functionality
- * -------------------------------------------------------------------------
  */
 int32_t npu_host_get_info(struct npu_device *npu_dev,
 			struct msm_npu_get_info_ioctl *get_info_ioctl)
@@ -1102,38 +1607,42 @@ int32_t npu_host_unmap_buf(struct npu_client *client,
 	 * fw is disabled
 	 */
 	if (host_ctx->fw_error && (host_ctx->fw_state == FW_ENABLED) &&
-		!wait_for_completion_interruptible_timeout(
+		!wait_for_completion_timeout(
 		&host_ctx->fw_deinit_done, NW_CMD_TIMEOUT))
-		pr_warn("npu: wait for fw_deinit_done time out\n");
+		NPU_WARN("npu: wait for fw_deinit_done time out\n");
 
 	mutex_lock(&host_ctx->lock);
 	npu_mem_unmap(client, unmap_ioctl->buf_ion_hdl,
 		unmap_ioctl->npu_phys_addr);
 	mutex_unlock(&host_ctx->lock);
+
 	return 0;
 }
 
 static int npu_send_network_cmd(struct npu_device *npu_dev,
-	struct npu_network *network, void *cmd_ptr, bool async)
+	struct npu_network *network, void *cmd_ptr, bool async, bool force)
 {
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 	int ret = 0;
 
+	WARN_ON(!mutex_is_locked(&host_ctx->lock));
+
 	if (network->fw_error || host_ctx->fw_error ||
-		(host_ctx->fw_state == FW_DISABLED)) {
-		pr_err("fw is in error state or disabled, can't send network cmd\n");
+		(host_ctx->fw_state != FW_ENABLED)) {
+		NPU_ERR("fw is in error state or disabled\n");
 		ret = -EIO;
-	} else if (network->cmd_pending) {
-		pr_err("Another cmd is pending\n");
+	} else if (network->cmd_pending && !force) {
+		NPU_ERR("Another cmd is pending\n");
 		ret = -EBUSY;
 	} else {
-		pr_err("Send cmd %d network id %d\n",
-			((struct ipc_cmd_header_pkt *)cmd_ptr)->cmd_type,
-			network->id);
 		network->cmd_async = async;
 		network->cmd_ret_status = 0;
 		network->cmd_pending = true;
 		network->trans_id = atomic_read(&host_ctx->ipc_trans_id);
+		reinit_completion(&network->cmd_done);
+		NPU_DBG("Send cmd %d network id %llx trans id %d\n",
+			((struct ipc_cmd_header_pkt *)cmd_ptr)->cmd_type,
+			network->id, network->trans_id);
 		ret = npu_host_ipc_send_cmd(npu_dev,
 			IPC_QUEUE_APPS_EXEC, cmd_ptr);
 		if (ret)
@@ -1149,41 +1658,25 @@ static int npu_send_misc_cmd(struct npu_device *npu_dev, uint32_t q_idx,
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 	int ret = 0;
 
-	mutex_lock(&host_ctx->lock);
-	if (host_ctx->fw_error || (host_ctx->fw_state == FW_DISABLED)) {
-		pr_err("fw is in error state or disabled, can't send misc cmd\n");
+	WARN_ON(!mutex_is_locked(&host_ctx->lock));
+
+	if (host_ctx->fw_error || (host_ctx->fw_state != FW_ENABLED)) {
+		NPU_ERR("fw is in error state or disabled\n");
 		ret = -EIO;
+	} else if (host_ctx->misc_cmd_pending) {
+		NPU_ERR("Another misc cmd is pending\n");
+		ret = -EBUSY;
 	} else {
-		pr_debug("Send cmd %d\n",
+		NPU_DBG("Send cmd %d\n",
 			((struct ipc_cmd_header_pkt *)cmd_ptr)->cmd_type);
-		host_ctx->cmd_ret_status = 0;
+		host_ctx->misc_cmd_pending = true;
+		reinit_completion(&host_ctx->misc_cmd_done);
 		ret = npu_host_ipc_send_cmd(npu_dev, q_idx, cmd_ptr);
+		if (ret)
+			host_ctx->misc_cmd_pending = false;
 	}
-	mutex_unlock(&host_ctx->lock);
 
 	return ret;
-}
-
-static void host_copy_patch_data(struct npu_patch_tuple *param, uint32_t value,
-		struct msm_npu_layer *layer_info)
-{
-	param->value = value;
-	param->chunk_id = layer_info->patch_info.chunk_id;
-	param->loc_offset = layer_info->patch_info.loc_offset;
-	param->instruction_size_in_bytes =
-		layer_info->patch_info.instruction_size_in_bytes;
-	param->shift_value_in_bits =
-		layer_info->patch_info.shift_value_in_bits;
-	param->variable_size_in_bits =
-		layer_info->patch_info.variable_size_in_bits;
-
-	pr_err("copy_patch_data: %x %d %x %x %x %x\n",
-		param->value,
-		param->chunk_id,
-		param->loc_offset,
-		param->instruction_size_in_bytes,
-		param->shift_value_in_bits,
-		param->variable_size_in_bits);
 }
 
 static void host_copy_patch_data_v2(struct npu_patch_tuple_v2 *param,
@@ -1196,7 +1689,7 @@ static void host_copy_patch_data_v2(struct npu_patch_tuple_v2 *param,
 		patch_info->instruction_size_in_bytes;
 	param->shift_value_in_bits = patch_info->shift_value_in_bits;
 	param->variable_size_in_bits = patch_info->variable_size_in_bits;
-	pr_err("copy_patch_data_v2: %x %d %x %x %x %x\n",
+	NPU_DBG("copy_patch_data_v2: %x %d %x %x %x %x\n",
 		param->value,
 		param->chunk_id,
 		param->loc_offset,
@@ -1225,7 +1718,7 @@ static uint32_t find_networks_perf_mode(struct npu_host_ctx *host_ctx)
 			network++;
 		}
 	}
-	pr_err("max perf mode for networks: %d\n", max_perf_mode);
+	NPU_DBG("max perf mode for networks: %d\n", max_perf_mode);
 
 	return max_perf_mode;
 }
@@ -1244,10 +1737,9 @@ static int set_perf_mode(struct npu_device *npu_dev)
 	if (npu_dev->pwrctrl.cur_dcvs_activity != NPU_DCVS_ACTIVITY_MAX_PERF)
 		networks_perf_mode = min_t(uint32_t, networks_perf_mode,
 			npu_dev->pwrctrl.cur_dcvs_activity);
-
 	ret = npu_set_uc_power_level(npu_dev, networks_perf_mode);
 	if (ret)
-		pr_err("network load failed due to power level set\n");
+		NPU_ERR("set uc power level %d failed\n", networks_perf_mode);
 
 	return ret;
 }
@@ -1255,7 +1747,7 @@ static int set_perf_mode(struct npu_device *npu_dev)
 static int update_dcvs_activity(struct npu_device *npu_dev, uint32_t activity)
 {
 	npu_dev->pwrctrl.cur_dcvs_activity = activity;
-	pr_debug("update dcvs activity to %d\n", activity);
+	NPU_DBG("update dcvs activity to %d\n", activity);
 
 	return set_perf_mode(npu_dev);
 }
@@ -1283,15 +1775,17 @@ int32_t npu_host_set_fw_property(struct npu_device *npu_dev,
 		prop_param = min_t(uint32_t, property->prop_param[0],
 			(uint32_t)(npu_dev->pwrctrl.num_pwrlevels - 1));
 		property->prop_param[0] = prop_param;
-		pr_debug("setting dcvs_mode to %d\n", prop_param);
+		NPU_DBG("setting dcvs_mode to %d[%d:%d]\n", prop_param,
+			property->prop_param[0],
+			(uint32_t)(npu_dev->pwrctrl.num_pwrlevels - 1));
 
 		if (property->network_hdl == 0) {
 			npu_dev->pwrctrl.dcvs_mode = prop_param;
-			pr_debug("Set global dcvs mode %d\n", prop_param);
+			NPU_DBG("Set global dcvs mode %d\n", prop_param);
 		}
 		break;
 	default:
-		pr_err("unsupported property received %d\n", property->prop_id);
+		NPU_ERR("unsupported property %d\n", property->prop_id);
 		goto set_prop_exit;
 	}
 
@@ -1307,35 +1801,38 @@ int32_t npu_host_set_fw_property(struct npu_device *npu_dev,
 	for (i = 0; i < num_of_params; i++)
 		prop_packet->prop_param[i] = property->prop_param[i];
 
-	reinit_completion(&host_ctx->property_done);
+	mutex_lock(&host_ctx->lock);
 	ret = npu_send_misc_cmd(npu_dev, IPC_QUEUE_APPS_EXEC,
 		prop_packet);
-	pr_debug("NPU_IPC_CMD_SET_PROPERTY sent status: %d\n", ret);
+	NPU_DBG("NPU_IPC_CMD_SET_PROPERTY sent status: %d\n", ret);
 
 	if (ret) {
-		pr_err("NPU_IPC_CMD_SET_PROPERTY failed\n");
+		NPU_ERR("NPU_IPC_CMD_SET_PROPERTY failed\n");
 		goto set_prop_exit;
 	}
+	mutex_unlock(&host_ctx->lock);
 
 	ret = wait_for_completion_interruptible_timeout(
-		&host_ctx->property_done,
+		&host_ctx->misc_cmd_done,
 		(host_ctx->fw_dbg_mode & FW_DBG_MODE_INC_TIMEOUT) ?
 		NW_DEBUG_TIMEOUT : NW_CMD_TIMEOUT);
 
+	mutex_lock(&host_ctx->lock);
 	if (!ret) {
-		pr_err_ratelimited("npu: NPU_IPC_CMD_SET_PROPERTY time out\n");
+		NPU_ERR("NPU_IPC_CMD_SET_PROPERTY time out\n");
 		ret = -ETIMEDOUT;
 		goto set_prop_exit;
 	} else if (ret < 0) {
-		pr_err("Wait for set_property done interrupted by signal\n");
+		NPU_ERR("Wait for set_property done interrupted by signal\n");
 		goto set_prop_exit;
 	}
 
-	ret = host_ctx->cmd_ret_status;
+	ret = host_ctx->misc_cmd_result;
 	if (ret)
-		pr_err("set fw property failed %d\n", ret);
+		NPU_ERR("set fw property failed %d\n", ret);
 
 set_prop_exit:
+	mutex_unlock(&host_ctx->lock);
 	kfree(prop_packet);
 	return ret;
 }
@@ -1369,31 +1866,33 @@ int32_t npu_host_get_fw_property(struct npu_device *npu_dev,
 	for (i = 0; i < num_of_params; i++)
 		prop_packet->prop_param[i] = property->prop_param[i];
 
-	reinit_completion(&host_ctx->property_done);
+	mutex_lock(&host_ctx->lock);
 	ret = npu_send_misc_cmd(npu_dev, IPC_QUEUE_APPS_EXEC,
 		prop_packet);
-	pr_debug("NPU_IPC_CMD_GET_PROPERTY sent status: %d\n", ret);
+	NPU_DBG("NPU_IPC_CMD_GET_PROPERTY sent status: %d\n", ret);
 
 	if (ret) {
-		pr_err("NPU_IPC_CMD_GET_PROPERTY failed\n");
+		NPU_ERR("NPU_IPC_CMD_GET_PROPERTY failed\n");
 		goto get_prop_exit;
 	}
+	mutex_unlock(&host_ctx->lock);
 
 	ret = wait_for_completion_interruptible_timeout(
-		&host_ctx->property_done,
+		&host_ctx->misc_cmd_done,
 		(host_ctx->fw_dbg_mode & FW_DBG_MODE_INC_TIMEOUT) ?
 		NW_DEBUG_TIMEOUT : NW_CMD_TIMEOUT);
 
+	mutex_lock(&host_ctx->lock);
 	if (!ret) {
 		pr_err_ratelimited("npu: NPU_IPC_CMD_GET_PROPERTY time out\n");
 		ret = -ETIMEDOUT;
 		goto get_prop_exit;
 	} else if (ret < 0) {
-		pr_err("Wait for get_property done interrupted by signal\n");
+		NPU_ERR("Wait for get_property done interrupted by signal\n");
 		goto get_prop_exit;
 	}
 
-	ret = host_ctx->cmd_ret_status;
+	ret = host_ctx->misc_cmd_result;
 	if (!ret) {
 		/* Return prop data retrieved from fw to user */
 		prop_from_fw = (struct msm_npu_property *)(host_ctx->prop_buf);
@@ -1405,112 +1904,12 @@ int32_t npu_host_get_fw_property(struct npu_device *npu_dev,
 					prop_from_fw->prop_param[i];
 		}
 	} else {
-		pr_err("get fw property failed %d\n", ret);
+		NPU_ERR("get fw property failed %d\n", ret);
 	}
 
 get_prop_exit:
+	mutex_unlock(&host_ctx->lock);
 	kfree(prop_packet);
-	return ret;
-}
-
-int32_t npu_host_load_network(struct npu_client *client,
-			struct msm_npu_load_network_ioctl *load_ioctl)
-{
-	int ret = 0;
-	struct npu_device *npu_dev = client->npu_dev;
-	struct npu_pwrctrl *pwr = &npu_dev->pwrctrl;
-	struct npu_network *network;
-	struct ipc_cmd_load_pkt load_packet;
-	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
-
-	ret = fw_init(npu_dev);
-	if (ret)
-		return ret;
-
-	mutex_lock(&host_ctx->lock);
-	network = alloc_network(host_ctx, client);
-	if (!network) {
-		ret = -ENOMEM;
-		goto err_deinit_fw;
-	}
-
-	network_get(network);
-	network->buf_hdl = load_ioctl->buf_ion_hdl;
-	network->size = load_ioctl->buf_size;
-	network->phy_add = load_ioctl->buf_phys_addr;
-	network->first_block_size = load_ioctl->first_block_size;
-	network->priority = load_ioctl->priority;
-	network->cur_perf_mode = network->init_perf_mode =
-		(load_ioctl->perf_mode == PERF_MODE_DEFAULT) ?
-			pwr->num_pwrlevels : load_ioctl->perf_mode;
-
-	/* verify mapped physical address */
-	if (!npu_mem_verify_addr(client, network->phy_add)) {
-		ret = -EINVAL;
-		goto error_free_network;
-	}
-
-	load_packet.header.cmd_type = NPU_IPC_CMD_LOAD;
-	load_packet.header.size = sizeof(struct ipc_cmd_load_pkt);
-	load_packet.header.trans_id =
-		atomic_add_return(1, &host_ctx->ipc_trans_id);
-	load_packet.header.flags = 0;
-
-	/* ACO Buffer. Use the npu mapped aco address */
-	load_packet.buf_pkt.address = (uint64_t)network->phy_add;
-	load_packet.buf_pkt.buf_size = network->first_block_size;
-	load_packet.buf_pkt.network_id = network->id;
-
-	set_perf_mode(npu_dev);
-	/* NPU_IPC_CMD_LOAD will go onto IPC_QUEUE_APPS_EXEC */
-	reinit_completion(&network->cmd_done);
-	ret = npu_send_network_cmd(npu_dev, network, &load_packet, false);
-	if (ret) {
-		pr_err("NPU_IPC_CMD_LOAD sent failed: %d\n", ret);
-		goto error_free_network;
-	}
-
-	mutex_unlock(&host_ctx->lock);
-
-	ret = wait_for_completion_interruptible_timeout(
-		&network->cmd_done,
-		(host_ctx->fw_dbg_mode & FW_DBG_MODE_INC_TIMEOUT) ?
-		NW_DEBUG_TIMEOUT : NW_CMD_TIMEOUT);
-
-	mutex_lock(&host_ctx->lock);
-	if (!ret) {
-		pr_err_ratelimited("NPU_IPC_CMD_LOAD time out\n");
-		ret = -ETIMEDOUT;
-		goto error_free_network;
-	} else if (ret < 0) {
-		pr_err("NPU_IPC_CMD_LOAD is interrupted by signal\n");
-		goto error_free_network;
-	}
-
-	if (network->fw_error) {
-		ret = -EIO;
-		pr_err("fw is in error state during load network\n");
-		goto error_free_network;
-	}
-
-	ret = network->cmd_ret_status;
-	if (ret)
-		goto error_free_network;
-
-	load_ioctl->network_hdl = network->network_hdl;
-	network->is_active = true;
-	network_put(network);
-
-	mutex_unlock(&host_ctx->lock);
-
-	return ret;
-
-error_free_network:
-	network_put(network);
-	free_network(host_ctx, client, network->id);
-err_deinit_fw:
-	mutex_unlock(&host_ctx->lock);
-	fw_deinit(npu_dev, false, true);
 	return ret;
 }
 
@@ -1523,13 +1922,11 @@ int32_t npu_host_load_network_v2(struct npu_client *client,
 	struct npu_pwrctrl *pwr = &npu_dev->pwrctrl;
 	struct npu_network *network;
 	struct ipc_cmd_load_pkt_v2 *load_packet = NULL;
+	struct ipc_cmd_unload_pkt unload_packet;
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 	uint32_t num_patch_params, pkt_size;
-	uint32_t retry_cnt = 5;
-	bool need_retry = false;
 
-retry_load:
-	ret = fw_init(npu_dev);
+	ret = enable_fw(npu_dev);
 	if (ret)
 		return ret;
 
@@ -1567,8 +1964,14 @@ retry_load:
 
 	/* verify mapped physical address */
 	if (!npu_mem_verify_addr(client, network->phy_add)) {
-		pr_err("Invalid network address %llx\n", network->phy_add);
+		NPU_ERR("Invalid network address %llx\n", network->phy_add);
 		ret = -EINVAL;
+		goto error_free_network;
+	}
+
+	ret = set_perf_mode(npu_dev);
+	if (ret) {
+		NPU_ERR("set_perf_mode failed\n");
 		goto error_free_network;
 	}
 
@@ -1576,7 +1979,7 @@ retry_load:
 	load_packet->header.size = pkt_size;
 	load_packet->header.trans_id =
 		atomic_add_return(1, &host_ctx->ipc_trans_id);
-	load_packet->header.flags = 0;
+	load_packet->header.flags = load_ioctl->flags;
 
 	/* ACO Buffer. Use the npu mapped aco address */
 	load_packet->buf_pkt.address = (uint32_t)network->phy_add;
@@ -1585,48 +1988,33 @@ retry_load:
 	load_packet->buf_pkt.num_layers = network->num_layers;
 	load_packet->num_patch_params = num_patch_params;
 
-	set_perf_mode(npu_dev);
-	/* NPU_IPC_CMD_LOAD_V2 will go onto IPC_QUEUE_APPS_EXEC */
-	reinit_completion(&network->cmd_done);
-	ret = npu_send_network_cmd(npu_dev, network, load_packet, false);
+	ret = npu_send_network_cmd(npu_dev, network, load_packet, false, false);
 	if (ret) {
-		pr_err("NPU_IPC_CMD_LOAD_V2 sent failed: %d\n", ret);
+		NPU_ERR("NPU_IPC_CMD_LOAD_V2 sent failed: %d\n", ret);
 		goto error_free_network;
 	}
 
 	mutex_unlock(&host_ctx->lock);
 
-	ret = wait_for_completion_interruptible_timeout(
+	ret = wait_for_completion_timeout(
 		&network->cmd_done,
 		(host_ctx->fw_dbg_mode & FW_DBG_MODE_INC_TIMEOUT) ?
 		NW_DEBUG_TIMEOUT : NW_CMD_TIMEOUT);
 
 	mutex_lock(&host_ctx->lock);
 
-	if (!ret) {
-		pr_err_ratelimited("npu: NPU_IPC_CMD_LOAD time out\n");
-		pr_err("REG_NPU_HOST_CTRL_STATUS %x\n",
-			REGR(npu_dev, REG_NPU_FW_CTRL_STATUS));
-		npu_dump_ipc_packet(npu_dev, load_packet);
-		npu_dump_all_ipc_queue(npu_dev);
-		npu_dump_dbg_registers(npu_dev);
-		ret = -ETIMEDOUT;
-		need_retry = true;
-		goto error_free_network;
-	} else if (ret < 0) {
-		pr_err("NPU_IPC_CMD_LOAD_V2 is interrupted by signal\n");
-		pr_err("REG_NPU_HOST_CTRL_STATUS %x\n",
-			REGR(npu_dev, REG_NPU_FW_CTRL_STATUS));
-		npu_dump_ipc_packet(npu_dev, load_packet);
-		npu_dump_all_ipc_queue(npu_dev);
-		npu_dump_dbg_registers(npu_dev);
+	if (network->fw_error) {
+		ret = -EIO;
+		NPU_ERR("fw is in error state during load_v2 network\n");
 		goto error_free_network;
 	}
 
-	if (network->fw_error) {
-		ret = -EIO;
-		pr_err("fw is in error state during load_v2 network\n");
-		goto error_free_network;
+	if (!ret) {
+		NPU_ERR("npu: NPU_IPC_CMD_LOAD time out %lld:%d\n",
+			network->id, network->trans_id);
+		npu_dump_debug_info(npu_dev);
+		ret = -ETIMEDOUT;
+		goto error_load_network;
 	}
 
 	ret = network->cmd_ret_status;
@@ -1637,24 +2025,29 @@ retry_load:
 	network->is_active = true;
 	kfree(load_packet);
 	network_put(network);
-
 	mutex_unlock(&host_ctx->lock);
 
 	return ret;
 
+error_load_network:
+	NPU_DBG("Unload network %lld\n", network->id);
+	/* send NPU_IPC_CMD_UNLOAD command to fw */
+	unload_packet.header.cmd_type = NPU_IPC_CMD_UNLOAD;
+	unload_packet.header.size = sizeof(struct ipc_cmd_unload_pkt);
+	unload_packet.header.trans_id =
+		atomic_add_return(1, &host_ctx->ipc_trans_id);
+	unload_packet.header.flags = 0;
+	unload_packet.network_hdl = (uint32_t)network->network_hdl;
+	npu_send_network_cmd(npu_dev, network, &unload_packet, false, true);
+	/* wait 200 ms to make sure fw has processed this command */
+	msleep(200);
 error_free_network:
 	kfree(load_packet);
 	network_put(network);
 	free_network(host_ctx, client, network->id);
 err_deinit_fw:
 	mutex_unlock(&host_ctx->lock);
-	fw_deinit(npu_dev, false, true);
-	if (need_retry && retry_cnt > 0) {
-		pr_err("retry load network: retry_cnt %d\n", retry_cnt);
-		retry_cnt--;
-		need_retry = false;
-		goto retry_load;
-	}
+	disable_fw(npu_dev);
 	return ret;
 }
 
@@ -1677,18 +2070,18 @@ int32_t npu_host_unload_network(struct npu_client *client,
 	}
 
 	if (!network->is_active) {
-		pr_err("network is not active\n");
+		NPU_ERR("network is not active\n");
 		network_put(network);
 		mutex_unlock(&host_ctx->lock);
 		return -EINVAL;
 	}
 
 	if (network->fw_error) {
-		pr_err("fw in error state, skip unload network in fw\n");
+		NPU_ERR("fw in error state, skip unload network in fw\n");
 		goto free_network;
 	}
 
-	pr_err("Unload network %d\n", network->id);
+	NPU_DBG("Unload network %lld\n", network->id);
 	/* prepare IPC packet for UNLOAD */
 	unload_packet.header.cmd_type = NPU_IPC_CMD_UNLOAD;
 	unload_packet.header.size = sizeof(struct ipc_cmd_unload_pkt);
@@ -1697,18 +2090,17 @@ int32_t npu_host_unload_network(struct npu_client *client,
 	unload_packet.header.flags = 0;
 	unload_packet.network_hdl = (uint32_t)network->network_hdl;
 
-	/* NPU_IPC_CMD_UNLOAD will go onto IPC_QUEUE_APPS_EXEC */
-	reinit_completion(&network->cmd_done);
-	ret = npu_send_network_cmd(npu_dev, network, &unload_packet, false);
+	ret = npu_send_network_cmd(npu_dev, network, &unload_packet, false,
+		false);
 
 	if (ret) {
-		pr_err("NPU_IPC_CMD_UNLOAD sent failed: %d\n", ret);
+		NPU_ERR("NPU_IPC_CMD_UNLOAD sent failed: %d\n", ret);
 		/*
 		 * If another command is running on this network,
 		 * don't free_network now.
 		 */
 		if (ret == -EBUSY) {
-			pr_err("Network is running, retry later\n");
+			NPU_ERR("Network is running, retry later\n");
 			network_put(network);
 			mutex_unlock(&host_ctx->lock);
 			return ret;
@@ -1718,31 +2110,30 @@ int32_t npu_host_unload_network(struct npu_client *client,
 
 	mutex_unlock(&host_ctx->lock);
 
-	ret = wait_for_completion_interruptible_timeout(
+	ret = wait_for_completion_timeout(
 		&network->cmd_done,
 		(host_ctx->fw_dbg_mode & FW_DBG_MODE_INC_TIMEOUT) ?
 		NW_DEBUG_TIMEOUT : NW_CMD_TIMEOUT);
 
 	mutex_lock(&host_ctx->lock);
 
-	if (!ret) {
-		pr_err_ratelimited("npu: NPU_IPC_CMD_UNLOAD time out\n");
-		network->cmd_pending = false;
-		ret = -ETIMEDOUT;
-		goto free_network;
-	} else if (ret < 0) {
-		pr_err("Wait for unload done interrupted by signal\n");
-		network->cmd_pending = false;
+	if (network->fw_error) {
+		ret = -EIO;
+		NPU_ERR("fw is in error state during unload network\n");
 		goto free_network;
 	}
 
-	if (network->fw_error) {
-		ret = -EIO;
-		pr_err("fw is in error state during unload network\n");
-	} else {
-		ret = network->cmd_ret_status;
-		pr_err("unload network status %d", ret);
+	if (!ret) {
+		NPU_ERR("npu: NPU_IPC_CMD_UNLOAD time out %llx:%d\n",
+			network->id, network->trans_id);
+		npu_dump_debug_info(npu_dev);
+		network->cmd_pending = false;
+		ret = -ETIMEDOUT;
+		goto free_network;
 	}
+
+	ret = network->cmd_ret_status;
+	NPU_DBG("unload network status %d\n", ret);
 
 free_network:
 	/*
@@ -1757,147 +2148,8 @@ free_network:
 		set_perf_mode(npu_dev);
 
 	mutex_unlock(&host_ctx->lock);
-	if (host_ctx->fw_unload_delay_ms) {
-		flush_delayed_work(&host_ctx->fw_deinit_work);
-		atomic_inc(&host_ctx->fw_deinit_work_cnt);
-		queue_delayed_work(host_ctx->wq, &host_ctx->fw_deinit_work,
-			msecs_to_jiffies(host_ctx->fw_unload_delay_ms));
-	} else {
-    		fw_deinit(npu_dev, false, true);
-	}
-	return ret;
-}
 
-int32_t npu_host_exec_network(struct npu_client *client,
-			struct msm_npu_exec_network_ioctl *exec_ioctl)
-{
-	struct npu_device *npu_dev = client->npu_dev;
-	struct ipc_cmd_execute_pkt exec_packet;
-	/* npu mapped addr */
-	uint64_t input_off, output_off;
-	int32_t ret;
-	struct npu_network *network;
-	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
-	bool async_ioctl = !!exec_ioctl->async;
-
-	mutex_lock(&host_ctx->lock);
-	network = get_network_by_hdl(host_ctx, client,
-		exec_ioctl->network_hdl);
-
-	if (!network) {
-		mutex_unlock(&host_ctx->lock);
-		return -EINVAL;
-	}
-
-	if (atomic_inc_return(&host_ctx->network_execute_cnt) == 1)
-		npu_notify_cdsprm_cxlimit_activity(npu_dev, true);
-
-	if (!network->is_active) {
-		pr_err("network is not active\n");
-		ret = -EINVAL;
-		goto exec_done;
-	}
-
-	if (network->fw_error) {
-		pr_err("fw is in error state\n");
-		ret = -EIO;
-		goto exec_done;
-	}
-
-	pr_err("execute network %d\n", network->id);
-	memset(&exec_packet, 0, sizeof(exec_packet));
-	if (exec_ioctl->patching_required) {
-		if ((exec_ioctl->input_layer_num != 1) ||
-			(exec_ioctl->output_layer_num != 1)) {
-			pr_err("Invalid input/output layer num\n");
-			ret = -EINVAL;
-			goto exec_done;
-		}
-
-		input_off = exec_ioctl->input_layers[0].buf_phys_addr;
-		output_off = exec_ioctl->output_layers[0].buf_phys_addr;
-		/* verify mapped physical address */
-		if (!npu_mem_verify_addr(client, input_off) ||
-			!npu_mem_verify_addr(client, output_off)) {
-			pr_err("Invalid patch buf address\n");
-			ret = -EINVAL;
-			goto exec_done;
-		}
-
-		exec_packet.patch_params.num_params = 2;
-		host_copy_patch_data(&exec_packet.patch_params.param[0],
-			(uint32_t)input_off, &exec_ioctl->input_layers[0]);
-		host_copy_patch_data(&exec_packet.patch_params.param[1],
-			(uint32_t)output_off, &exec_ioctl->output_layers[0]);
-	} else {
-		exec_packet.patch_params.num_params = 0;
-	}
-
-	exec_packet.header.cmd_type = NPU_IPC_CMD_EXECUTE;
-	exec_packet.header.size = sizeof(struct ipc_cmd_execute_pkt);
-	exec_packet.header.trans_id =
-		atomic_add_return(1, &host_ctx->ipc_trans_id);
-	exec_packet.header.flags = 0xF;
-	exec_packet.network_hdl = network->network_hdl;
-
-	/* Send it on the high priority queue */
-	reinit_completion(&network->cmd_done);
-	ret = npu_send_network_cmd(npu_dev, network, &exec_packet, async_ioctl);
-
-	if (ret) {
-		pr_err("NPU_IPC_CMD_EXECUTE sent failed: %d\n", ret);
-		goto exec_done;
-	}
-
-	if (async_ioctl) {
-		pr_debug("Async ioctl, return now\n");
-		goto exec_done;
-	}
-
-	mutex_unlock(&host_ctx->lock);
-
-	ret = wait_for_completion_interruptible_timeout(
-		&network->cmd_done,
-		(host_ctx->fw_dbg_mode & FW_DBG_MODE_INC_TIMEOUT) ?
-		NW_DEBUG_TIMEOUT : NW_CMD_TIMEOUT);
-
-	mutex_lock(&host_ctx->lock);
-	if (!ret) {
-		pr_err_ratelimited("npu: NPU_IPC_CMD_EXECUTE time out\n");
-		/* dump debug stats */
-		npu_dump_debug_timeout_stats(npu_dev);
-		network->cmd_pending = false;
-		ret = -ETIMEDOUT;
-		goto exec_done;
-	} else if (ret == -ERESTARTSYS) {
-		pr_err("Wait for execution done interrupted by signal\n");
-		network->cmd_pending = false;
-		goto exec_done;
-	}
-
-	if (network->fw_error) {
-		ret = -EIO;
-		pr_err("fw is in error state during execute network\n");
-	} else {
-		ret = network->cmd_ret_status;
-		pr_err("execution status %d", ret);
-	}
-
-exec_done:
-	network_put(network);
-	mutex_unlock(&host_ctx->lock);
-
-	/*
-	 * treat network execution timed our or interrupted by signal
-	 * as error in order to force npu fw to stop execution
-	 */
-	if ((ret == -ETIMEDOUT) || (ret == -ERESTARTSYS)) {
-		pr_err("Error handling after execution failure\n");
-		host_error_hdlr(npu_dev, true);
-	}
-
-	if (atomic_dec_return(&host_ctx->network_execute_cnt) == 0)
-		npu_notify_cdsprm_cxlimit_activity(npu_dev, false);
+	disable_fw(npu_dev);
 
 	return ret;
 }
@@ -1924,22 +2176,19 @@ int32_t npu_host_exec_network_v2(struct npu_client *client,
 		return -EINVAL;
 	}
 
-	if (atomic_inc_return(&host_ctx->network_execute_cnt) == 1)
-		npu_notify_cdsprm_cxlimit_activity(npu_dev, true);
-
 	if (!network->is_active) {
-		pr_err("network is not active\n");
+		NPU_ERR("network is not active\n");
 		ret = -EINVAL;
 		goto exec_v2_done;
 	}
 
 	if (network->fw_error) {
-		pr_err("fw is in error state\n");
+		NPU_ERR("fw is in error state\n");
 		ret = -EIO;
 		goto exec_v2_done;
 	}
 
-	pr_err("execute_v2 network %d\n", network->id);
+	NPU_DBG("execute_v2 network %lld\n", network->id);
 	num_patch_params = exec_ioctl->patch_buf_info_num;
 	pkt_size = num_patch_params * sizeof(struct npu_patch_params_v2) +
 		sizeof(*exec_packet);
@@ -1952,17 +2201,17 @@ int32_t npu_host_exec_network_v2(struct npu_client *client,
 
 	for (i = 0; i < num_patch_params; i++) {
 		exec_packet->patch_params[i].id = patch_buf_info[i].buf_id;
-		pr_err("%d: patch_id: %x\n", i,
+		NPU_DBG("%d: patch_id: %x\n", i,
 			exec_packet->patch_params[i].id);
 		exec_packet->patch_params[i].value =
 			patch_buf_info[i].buf_phys_addr;
-		pr_err("%d: patch value: %x\n", i,
+		NPU_DBG("%d: patch value: %x\n", i,
 			exec_packet->patch_params[i].value);
 
 		/* verify mapped physical address */
 		if (!npu_mem_verify_addr(client,
 			patch_buf_info[i].buf_phys_addr)) {
-			pr_err("Invalid patch value\n");
+			NPU_ERR("Invalid patch value\n");
 			ret = -EINVAL;
 			goto free_exec_packet;
 		}
@@ -1980,47 +2229,42 @@ int32_t npu_host_exec_network_v2(struct npu_client *client,
 	network->stats_buf_u = (void __user *)exec_ioctl->stats_buf_addr;
 	network->stats_buf_size = exec_ioctl->stats_buf_size;
 
-	pr_err("Execute_v2 flags %x stats_buf_size %d\n",
+	NPU_DBG("Execute_v2 flags %x stats_buf_size %d\n",
 		exec_packet->header.flags, exec_ioctl->stats_buf_size);
 
-	/* Send it on the high priority queue */
-	reinit_completion(&network->cmd_done);
-	ret = npu_send_network_cmd(npu_dev, network, exec_packet, async_ioctl);
+	ret = npu_send_network_cmd(npu_dev, network, exec_packet, async_ioctl,
+		false);
 
 	if (ret) {
-		pr_err("NPU_IPC_CMD_EXECUTE_V2 sent failed: %d\n", ret);
+		NPU_ERR("NPU_IPC_CMD_EXECUTE_V2 sent failed: %d\n", ret);
 		goto free_exec_packet;
 	}
 
 	if (async_ioctl) {
-		pr_err("Async ioctl, return now\n");
+		NPU_DBG("Async ioctl, return now\n");
 		goto free_exec_packet;
 	}
 
 	mutex_unlock(&host_ctx->lock);
 
-	ret = wait_for_completion_interruptible_timeout(
+	ret = wait_for_completion_timeout(
 		&network->cmd_done,
 		(host_ctx->fw_dbg_mode & FW_DBG_MODE_INC_TIMEOUT) ?
 		NW_DEBUG_TIMEOUT : NW_CMD_TIMEOUT);
 
 	mutex_lock(&host_ctx->lock);
-	if (!ret) {
-		pr_err_ratelimited("npu: NPU_IPC_CMD_EXECUTE_V2 time out\n");
-		/* dump debug stats */
-		npu_dump_debug_timeout_stats(npu_dev);
-		network->cmd_pending = false;
-		ret = -ETIMEDOUT;
-		goto free_exec_packet;
-	} else if (ret == -ERESTARTSYS) {
-		pr_err("Wait for execution_v2 done interrupted by signal\n");
-		network->cmd_pending = false;
+	if (network->fw_error) {
+		ret = -EIO;
+		NPU_ERR("fw is in error state during execute_v2 network\n");
 		goto free_exec_packet;
 	}
 
-	if (network->fw_error) {
-		ret = -EIO;
-		pr_err("fw is in error state during execute_v2 network\n");
+	if (!ret) {
+		NPU_ERR("npu: %llx:%d NPU_IPC_CMD_EXECUTE_V2 time out\n",
+			network->id, network->trans_id);
+		npu_dump_debug_info(npu_dev);
+		network->cmd_pending = false;
+		ret = -ETIMEDOUT;
 		goto free_exec_packet;
 	}
 
@@ -2031,11 +2275,11 @@ int32_t npu_host_exec_network_v2(struct npu_client *client,
 			(void __user *)exec_ioctl->stats_buf_addr,
 			network->stats_buf,
 			exec_ioctl->stats_buf_size)) {
-			pr_err("copy stats to user failed\n");
+			NPU_ERR("copy stats to user failed\n");
 			exec_ioctl->stats_buf_size = 0;
 		}
 	} else {
-		pr_err("execution failed %d\n", ret);
+		NPU_ERR("execution failed %d\n", ret);
 	}
 
 free_exec_packet:
@@ -2045,16 +2289,13 @@ exec_v2_done:
 	mutex_unlock(&host_ctx->lock);
 
 	/*
-	 * treat network execution timed our or interrupted by signal
-	 * as error in order to force npu fw to stop execution
+	 * treat network execution timed out as error in order to
+	 * force npu fw to stop execution
 	 */
-	if ((ret == -ETIMEDOUT) || (ret == -ERESTARTSYS)) {
-		pr_err("Error handling after execution failure\n");
+	if (ret == -ETIMEDOUT) {
+		NPU_ERR("Error handling after execution failure\n");
 		host_error_hdlr(npu_dev, true);
 	}
-
-	if (atomic_dec_return(&host_ctx->network_execute_cnt) == 0)
-		npu_notify_cdsprm_cxlimit_activity(npu_dev, false);
 
 	return ret;
 }
@@ -2065,9 +2306,11 @@ int32_t npu_host_loopback_test(struct npu_device *npu_dev)
 	struct npu_host_ctx *host_ctx = &npu_dev->host_ctx;
 	int32_t ret;
 
-	ret = fw_init(npu_dev);
+	ret = enable_fw(npu_dev);
 	if (ret)
 		return ret;
+
+	mutex_lock(&host_ctx->lock);
 
 	loopback_packet.header.cmd_type = NPU_IPC_CMD_LOOPBACK;
 	loopback_packet.header.size = sizeof(struct ipc_cmd_loopback_pkt);
@@ -2076,28 +2319,35 @@ int32_t npu_host_loopback_test(struct npu_device *npu_dev)
 	loopback_packet.header.flags = 0;
 	loopback_packet.loopbackParams = 15;
 
-	reinit_completion(&host_ctx->loopback_done);
 	ret = npu_send_misc_cmd(npu_dev, IPC_QUEUE_APPS_EXEC, &loopback_packet);
 
 	if (ret) {
-		pr_err("NPU_IPC_CMD_LOOPBACK sent failed: %d\n", ret);
+		NPU_ERR("NPU_IPC_CMD_LOOPBACK sent failed: %d\n", ret);
 		goto loopback_exit;
 	}
 
+	mutex_unlock(&host_ctx->lock);
+
 	ret = wait_for_completion_interruptible_timeout(
-		&host_ctx->loopback_done,
+		&host_ctx->misc_cmd_done,
 		(host_ctx->fw_dbg_mode & FW_DBG_MODE_INC_TIMEOUT) ?
 		NW_DEBUG_TIMEOUT : NW_CMD_TIMEOUT);
 
+	mutex_lock(&host_ctx->lock);
+
 	if (!ret) {
-		pr_err_ratelimited("npu: NPU_IPC_CMD_LOOPBACK time out\n");
+		NPU_ERR("npu: NPU_IPC_CMD_LOOPBACK time out\n");
+		npu_dump_debug_info(npu_dev);
 		ret = -ETIMEDOUT;
 	} else if (ret < 0) {
-		pr_err("Wait for loopback done interrupted by signal\n");
+		NPU_ERR("Wait for loopback done interrupted by signal\n");
+	} else {
+		ret = host_ctx->misc_cmd_result;
 	}
 
 loopback_exit:
-	fw_deinit(npu_dev, false, true);
+	mutex_unlock(&host_ctx->lock);
+	disable_fw(npu_dev);
 
 	return ret;
 }
@@ -2115,7 +2365,7 @@ void npu_host_cleanup_networks(struct npu_client *client)
 	for (i = 0; i < MAX_LOADED_NETWORK; i++) {
 		network = &host_ctx->networks[i];
 		if (network->client == client) {
-			pr_warn("network %d is not unloaded before close\n",
+			NPU_WARN("network %d is not unloaded before close\n",
 				network->network_hdl);
 			unload_req.network_hdl = network->network_hdl;
 			npu_host_unload_network(client, &unload_req);
@@ -2126,7 +2376,7 @@ void npu_host_cleanup_networks(struct npu_client *client)
 	while (!list_empty(&client->mapped_buffer_list)) {
 		ion_buf = list_first_entry(&client->mapped_buffer_list,
 			struct npu_ion_buf, list);
-		pr_warn("unmap buffer %x:%llx\n", ion_buf->fd, ion_buf->iova);
+		NPU_DBG("unmap buffer %x:%llx\n", ion_buf->fd, ion_buf->iova);
 		unmap_req.buf_ion_hdl = ion_buf->fd;
 		unmap_req.npu_phys_addr = ion_buf->iova;
 		npu_host_unmap_buf(client, &unmap_req);
@@ -2151,30 +2401,30 @@ int32_t npu_host_set_perf_mode(struct npu_client *client, uint32_t network_hdl,
 	mutex_lock(&host_ctx->lock);
 
 	if (network_hdl == 0) {
-		pr_debug("change perf_mode_override to %d\n", perf_mode);
+		NPU_DBG("change perf_mode_override to %d\n", perf_mode);
 		npu_dev->pwrctrl.perf_mode_override = perf_mode;
 	} else {
 		network = get_network_by_hdl(host_ctx, client, network_hdl);
 		if (!network) {
-			pr_err("invalid network handle %x\n", network_hdl);
+			NPU_ERR("invalid network handle %x\n", network_hdl);
 			mutex_unlock(&host_ctx->lock);
 			return -EINVAL;
 		}
 
 		if (perf_mode == 0) {
 			network->cur_perf_mode = network->init_perf_mode;
-			pr_debug("change network %d perf_mode back to %d\n",
+			NPU_DBG("change network %d perf_mode back to %d\n",
 				network_hdl, network->cur_perf_mode);
 		} else {
 			network->cur_perf_mode = perf_mode;
-			pr_debug("change network %d perf_mode to %d\n",
+			NPU_DBG("change network %d perf_mode to %d\n",
 				network_hdl, network->cur_perf_mode);
 		}
 	}
 
 	ret = set_perf_mode(npu_dev);
 	if (ret)
-		pr_err("set_perf_mode failed");
+		NPU_ERR("set_perf_mode failed\n");
 
 	if (network)
 		network_put(network);
@@ -2202,7 +2452,7 @@ int32_t npu_host_get_perf_mode(struct npu_client *client, uint32_t network_hdl)
 	} else {
 		network = get_network_by_hdl(host_ctx, client, network_hdl);
 		if (!network) {
-			pr_err("invalid network handle %x\n", network_hdl);
+			NPU_ERR("invalid network handle %x\n", network_hdl);
 			mutex_unlock(&host_ctx->lock);
 			return -EINVAL;
 		}

@@ -526,12 +526,12 @@ int cam_ois_init(struct cam_ois_ctrl_t *o_ctrl)
 
  	rc = cam_ois_i2c_write(o_ctrl, 0x0262, 0x55,CAMERA_SENSOR_I2C_TYPE_WORD, CAMERA_SENSOR_I2C_TYPE_BYTE);
 	if (rc < 0) {
-     		CAM_ERR(CAM_OIS, "ois i2c write failed rc %d", rc);
+		CAM_ERR(CAM_OIS, "ois i2c write failed rc %d", rc);
 	} 
  	rc = cam_ois_i2c_write(o_ctrl, 0x0264, 0x6F12033B,
 		CAMERA_SENSOR_I2C_TYPE_WORD, CAMERA_SENSOR_I2C_TYPE_DWORD);
  	if (rc < 0) {
-      		CAM_ERR(CAM_OIS, "ois i2c write failed, rc %d", rc);
+		CAM_ERR(CAM_OIS, "ois i2c write failed, rc %d", rc);
 	}
 
 	// OIS Shift Setting

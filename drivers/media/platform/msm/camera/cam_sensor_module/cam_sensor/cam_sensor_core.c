@@ -28,9 +28,7 @@ extern void pdo_ctrl_by_flash(bool mode);
 struct cam_sensor_ctrl_t *g_s_ctrl_tof;
 int check_pd_ready;
 #endif
-#if defined(CONFIG_SEC_A71_PROJECT)
-extern char otp_info[5];
-#endif
+
 #if defined(CONFIG_USE_CAMERA_HW_BIG_DATA)
 //#define HWB_FILE_OPERATION 1
 uint32_t sec_sensor_position;
@@ -363,7 +361,7 @@ static int32_t cam_sensor_i2c_modes_util(
 				rc);
 			return rc;
 		}
-#if defined(CONFIG_SEC_A90Q_PROJECT) || defined(CONFIG_SEC_A71_PROJECT)
+#if defined(CONFIG_SEC_A90Q_PROJECT) || defined(CONFIG_SEC_A70S_PROJECT)  || defined(CONFIG_SEC_A71_PROJECT)
 		if ((i2c_list->i2c_settings.size > 0)
 			&& (i2c_list->i2c_settings.reg_setting[0].reg_addr == STREAM_ON_ADDR_IMX586_S5K4HA || i2c_list->i2c_settings.reg_setting[0].reg_addr == STREAM_ON_ADDR_IMX316)
 			&& (i2c_list->i2c_settings.reg_setting[0].reg_data == 0x0)) {
@@ -766,7 +764,7 @@ int32_t cam_sensor_driver_cmd(struct cam_sensor_ctrl_t *s_ctrl,
 	struct cam_hw_param *hw_param = NULL;
 #endif
 
-#if defined(CONFIG_SEC_A71_PROJECT)
+#if defined(CONFIG_SEC_A71_PROJECT) || defined(CONFIG_SEC_A70S_PROJECT)
 	uint32_t version_id = 0;
 	uint16_t sensor_id = 0;
 	uint16_t expected_version_id = 0;
@@ -844,7 +842,7 @@ int32_t cam_sensor_driver_cmd(struct cam_sensor_ctrl_t *s_ctrl,
 			goto free_power_settings;
 		}
 
-#if defined(CONFIG_SEC_A71_PROJECT)
+#if defined(CONFIG_SEC_A71_PROJECT) || defined(CONFIG_SEC_A70S_PROJECT)
 		if (s_ctrl->soc_info.index == 0) { // check Rear GW1
 			sensor_id = s_ctrl->sensordata->slave_info.sensor_id;
 			expected_version_id = s_ctrl->sensordata->slave_info.version_id;
@@ -861,15 +859,10 @@ int32_t cam_sensor_driver_cmd(struct cam_sensor_ctrl_t *s_ctrl,
 					"Read version id 0x%x,expected_version_id 0x%x", version_id, expected_version_id);
 					if (version_id == expected_version_id && version_id == 0XA0)
 						CAM_INFO(CAM_SENSOR, "Found A0 Sensor");
-					else if (version_id == expected_version_id && version_id == 0XA1){
+					else if (version_id == expected_version_id && version_id == 0XA1)
 						CAM_INFO(CAM_SENSOR, "Found A1 Sensor");
-						strlcpy(otp_info,"0", sizeof(otp_info));
-					}					
-
-					else if (version_id == expected_version_id && version_id == 0XA2){
+					else if (version_id == expected_version_id && version_id == 0XA2)
 						CAM_INFO(CAM_SENSOR, "Found A2 Sensor");
-						strlcpy(otp_info,"1", sizeof(otp_info));
-					}
 					else {
 						CAM_INFO(CAM_SENSOR, "Not matched");
 						rc = -EINVAL;
