@@ -214,9 +214,12 @@ obj-y				+= motor/
 obj-$(CONFIG_UH)	+= uh/
 
 # FIVE TEE driver
-obj-$(CONFIG_FIVE_TEE_DRIVER)	+= five/
+obj-$(CONFIG_FIVE_TEE_DRIVER)	+= security/samsung/five_tee_driver/
 obj-$(CONFIG_ICD)		+= security/samsung/icdrv/
 
 obj-y				+= kperfmon/
 
 obj-$(CONFIG_SEC_SVDM)	+= ccic/
+
+#TZIC
+obj-y  += security/samsung/tzic/

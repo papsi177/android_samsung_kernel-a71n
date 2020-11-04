@@ -212,6 +212,7 @@ static ssize_t light_lcd_onoff_store(struct device *dev,
 	return size;
 }
 
+#if defined(CONFIG_SEC_A71_PROJECT) 
 static unsigned int system_rev __read_mostly;
 
 static int __init sec_hw_rev_setup(char *p)
@@ -234,6 +235,7 @@ static unsigned int sec_hw_rev(void)
 {
 	return system_rev;
 }
+#endif
 
 static ssize_t light_circle_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
@@ -243,6 +245,8 @@ static ssize_t light_circle_show(struct device *dev,
 		return snprintf(buf, PAGE_SIZE, "19.87 5.08 2.4\n");
 	else
 		return snprintf(buf, PAGE_SIZE, "53.20 2.41 1.8\n");
+#elif defined(CONFIG_SEC_M51_PROJECT)
+	return snprintf(buf, PAGE_SIZE, "23.05 6.08 2.8\n");
 #else
 	return snprintf(buf, PAGE_SIZE, "0 0 0\n");
 #endif

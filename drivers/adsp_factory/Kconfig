@@ -115,6 +115,15 @@ config SUPPORT_SSC_MODE
 	help
 	  Support the ssc mode function.
 
+config MMC5603X_FACTORY
+	tristate "factory test for SSC - MMC5603X"
+	default n
+	help
+	  mmc5603x factory driver.
+	  provide sysfs for factory test.
+	  request selftest to adsp_factory.
+	  receive test result from adsp_factory.
+
 config SUPPORT_SSC_MODE_FOR_MAG
 	tristate "Support ssc mode for mag function for mag sensor"
 	default n

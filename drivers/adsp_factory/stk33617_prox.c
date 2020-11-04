@@ -337,10 +337,22 @@ static ssize_t prox_fac_cal_store(struct device *dev,
 
 		mutex_unlock(&data->prox_factory_mutex);
 
-		threshold[0] = (uint16_t)data->msg_buf[MSG_PROX][0];
-		threshold[1] = (uint16_t)data->msg_buf[MSG_PROX][1];
-		threshold[2] = (uint16_t)data->msg_buf[MSG_PROX][2];
-		threshold[3] = (uint16_t)data->msg_buf[MSG_PROX][3];
+		ret = prox_read_cal_data(threshold);
+		if (ret < 0) {
+			pr_err("[FACTORY] %s: prox_read_cal_data() failed(%d)\n", __func__, ret);
+			return ret;
+		}
+
+		if (msg_buf[0] == 1)
+		{
+			threshold[0] = (uint16_t)data->msg_buf[MSG_PROX][0];
+			threshold[1] = (uint16_t)data->msg_buf[MSG_PROX][1];
+		}
+		else
+		{
+			threshold[2] = (uint16_t)data->msg_buf[MSG_PROX][2];
+			threshold[3] = (uint16_t)data->msg_buf[MSG_PROX][3];
+		}
 
 		pr_info("[FACTORY] %s: %u, %u, %u, %u\n", __func__, threshold[0], threshold[1], threshold[2], threshold[3]);
 
@@ -379,6 +391,19 @@ void prox_factory_init_work(void)
 		pr_err("[FACTORY]: %s: prox_read_cal_data() failed(%d)\n", __func__, ret);
 	}
 	else {
+#if defined(CONFIG_SUPPORT_PROX_DUALIZATION) && !defined(CONFIG_SEC_FACTORY)
+		if (threshold[0] != 0 && threshold[1] != 0)
+		{
+		  threshold[0] += 100;
+		  threshold[1] += 100;
+		}
+
+		if (threshold[2] != 0 && threshold[3] != 0)
+		{
+		  threshold[2] += 100;
+		  threshold[3] += 100;
+		}
+#endif
 		msg_buf[0] = (int32_t)threshold[0];
 		msg_buf[1] = (int32_t)threshold[1];
 		msg_buf[2] = (int32_t)threshold[2];
