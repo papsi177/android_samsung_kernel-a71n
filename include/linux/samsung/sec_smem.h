@@ -217,13 +217,13 @@ static inline uint16_t ddr_get_small_eye_detected(void) { return 0; }
 extern void sec_smem_cpuclk_log_raw(size_t slot, unsigned long rate);
 
 /* called @ drivers/clk/qcom/clk-cpu-osm.c */
-extern void sec_smem_clk_osm_add_log_cpufreq(struct cpufreq_policy *policy, unsigned int index, const char *name);
+extern void sec_smem_clk_osm_add_log_cpufreq(unsigned int cpu, unsigned long rate, const char *name);
 
 /* called @ drivers/clk/qcom/clk-cpu-osm.c */
 extern void sec_smem_clk_osm_add_log_l3(unsigned long rate);
 #else
 static inline void sec_smem_cpuclk_log_raw(size_t slot, unsigned long rate) {}
-static inline void sec_smem_clk_osm_add_log_cpufreq(struct cpufreq_policy *policy, unsigned int index, const char *name) {}
+static inline void sec_smem_clk_osm_add_log_cpufreq(unsigned int cpu, unsigned long rate, const char *name) {}
 static inline void sec_smem_clk_osm_add_log_l3(unsigned long rate) {}
 #endif
 

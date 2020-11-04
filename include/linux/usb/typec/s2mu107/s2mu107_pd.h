@@ -862,6 +862,7 @@ struct usbpd_data {
 	int					id_matched;
 
 	int					msg_id;
+	int					alert_msg_id;
 	int					specification_revision;
 	struct mutex		accept_mutex;
 
